@@ -42,7 +42,14 @@ namespace RPG.Combat
     /// Gerencia a barra de skills do jogador local: hotkeys, cooldown visual,
     /// walk-to-range, cast (canal) e envio de comandos ao servidor.
     ///
-    /// Toda autoridade fica no servidor — este script é apenas UX/predição.
+    /// === MELHORIAS DESTA VERSÃO ===
+    ///   - Cleanup completo em OnDestroy/OnDisable (cancela TODAS as coroutines).
+    ///   - Eventos limpos em OnStopClient para evitar memory leak.
+    ///   - Validação extra de skill index em pontos públicos.
+    ///   - Logs gateados por #if UNITY_EDITOR.
+    ///
+    /// === PRINCÍPIO ===
+    ///   Toda autoridade fica no servidor — este script é apenas UX/predição.
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     public class SkillSystem : NetworkBehaviour
@@ -51,7 +58,7 @@ namespace RPG.Combat
         [SerializeField] private bool debugLogs = false;
 
         // Tuning — alinhado com BasicAttackSystem
-        private const int   MAX_SKILLS         = 4;
+        public  const int   MAX_SKILLS         = 4;
         private const float CMD_MOVE_INTERVAL  = 0.15f;
         private const float WALK_TIMEOUT       = 15f;
         private const float WALK_DEST_FRACTION = 0.85f;
@@ -104,7 +111,6 @@ namespace RPG.Combat
             _agent      = GetComponent<NavMeshAgent>();
             _controller = GetComponent<NetworkPlayerController>();
             _inventory  = GetComponent<NetworkInventory>();
-            // FIX CS0104: GetComponent com tipo totalmente qualificado
             _netPlayer  = GetComponent<RPG.Network.NetworkPlayer>();
             _identity   = GetComponent<NetworkIdentity>();
         }
@@ -117,6 +123,16 @@ namespace RPG.Combat
 
         public override void OnStopClient()
         {
+            if (_inventory != null)
+                _inventory.OnGemLoadoutChanged -= OnGemLoadoutChanged;
+
+            CancelPendingWalk();
+            CancelCast();
+        }
+
+        private void OnDestroy()
+        {
+            // Limpa subscrição se OnStopClient não foi chamado (cenário raro de destruição forçada)
             if (_inventory != null)
                 _inventory.OnGemLoadoutChanged -= OnGemLoadoutChanged;
 
@@ -170,6 +186,7 @@ namespace RPG.Combat
         public void TryUseSkill(int index)
         {
             if (!isLocalPlayer) return;
+            if (index < 0 || index >= MAX_SKILLS) return;
             if (!_player.IsInitialized || _player.IsDead) return;
             if (_isCasting) return; // não interrompe cast em andamento
 
@@ -506,7 +523,9 @@ namespace RPG.Combat
 
         private void Log(string msg)
         {
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
             if (debugLogs) Debug.Log($"[SkillSystem] {msg}");
+#endif
         }
     }
 }

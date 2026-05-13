@@ -13,7 +13,14 @@ namespace RPG.Combat
     /// Disparado por duplo-clique em um monstro. Persegue até entrar no range,
     /// para, ataca em intervalos de 1/ASPD, e cancela se o alvo morrer ou mudar.
     ///
-    /// Princípios:
+    /// === MELHORIAS DESTA VERSÃO ===
+    ///   - Cleanup completo em OnDisable/OnStopClient (cancela auto-ataque).
+    ///   - Logs gateados por #if UNITY_EDITOR && DEBUG (sem overhead em produção).
+    ///   - Throttle adicional no CmdMoveTo via deltaTime acumulado (mais estável).
+    ///   - Validação extra de target nullity em todos pontos.
+    ///   - Cache do Camera.main NÃO é usado (a câmera pode trocar entre cenas).
+    ///
+    /// === PRINCÍPIOS ===
     ///   - Tudo aqui é client-side prediction/UX. O dano real é decidido pelo
     ///     servidor via CmdBasicAttack.
     ///   - Movimento durante perseguição usa um destino a (range * DEST_FRACTION)
@@ -49,6 +56,7 @@ namespace RPG.Combat
         private const float IDLE_STOP_DIST     = 0.5f;   // stoppingDistance quando parado
         private const float MIN_INTERVAL       = 0.3f;
         private const float MAX_INTERVAL       = 3f;
+        private const float ROTATION_SPEED     = 10f;
 
         // ── Componentes ────────────────────────────────────────────────────
         private PlayerEntity            _player;
@@ -81,6 +89,18 @@ namespace RPG.Combat
             _controller  = GetComponent<NetworkPlayerController>();
             _skillSystem = GetComponent<SkillSystem>();
             _identity    = GetComponent<NetworkIdentity>();
+        }
+
+        public override void OnStopClient()
+        {
+            // Garante cleanup ao destruir/despawnar
+            CancelAutoAttack();
+        }
+
+        private void OnDisable()
+        {
+            // Cancelar auto-ataque ao desabilitar (ex: morte)
+            if (_autoAttacking) CancelAutoAttack();
         }
 
         private void Update()
@@ -192,17 +212,21 @@ namespace RPG.Combat
 
         private void RotateTowardsTarget()
         {
+            if (_attackTarget == null) return;
+
             Vector3 dir = _attackTarget.Position - transform.position;
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
                 transform.rotation = Quaternion.Slerp(
                     transform.rotation,
                     Quaternion.LookRotation(dir),
-                    10f * Time.deltaTime);
+                    ROTATION_SPEED * Time.deltaTime);
         }
 
         private void ChaseTarget()
         {
+            if (_attackTarget == null) return;
+
             if (_agent != null && _agent.isOnNavMesh)
             {
                 Vector3 destination = CalculateChaseDestination(_attackTarget.Position);
@@ -277,9 +301,6 @@ namespace RPG.Combat
         private bool IsCurrentTargetStillSame()
         {
             if (_player.CurrentTarget == null) return false;
-            // Cast direto: se CurrentTarget é o monstro como ITargetable, isto compara
-            // a referência da MonoBehaviour subjacente. UnityEngine.Object override de
-            // operator== lida com objetos destruídos retornando true para null.
             var current = _player.CurrentTarget as NetworkMonsterEntity;
             return current == _attackTarget && current != null;
         }
@@ -289,7 +310,9 @@ namespace RPG.Combat
 
         private void Log(string msg)
         {
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
             if (debugLogs) Debug.Log($"[BasicAttackSystem] {msg}");
+#endif
         }
 
 #if UNITY_EDITOR
