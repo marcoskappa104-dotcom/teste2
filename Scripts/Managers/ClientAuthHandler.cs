@@ -13,6 +13,11 @@ namespace RPG.Network
     /// requisições de login/criação/seleção ao servidor.
     ///
     /// Singleton DontDestroyOnLoad — sobrevive a trocas de cena.
+    ///
+    /// === MELHORIAS DESTA VERSÃO ===
+    ///   - Cleanup COMPLETO em OnDisconnect (cancela coroutines e desinscreve sceneLoaded)
+    ///   - StopAllCoroutines em OnDestroy
+    ///   - Tracking explícito da coroutine de WaitForNonceThenLogin para cancelamento
     /// </summary>
     public class ClientAuthHandler : MonoBehaviour
     {
@@ -27,10 +32,11 @@ namespace RPG.Network
 
         private const float NONCE_WAIT_TIMEOUT = 5f;
 
-        private bool   _waitingForSceneToLoad;
-        private string _sessionNonce  = "";
-        private bool   _nonceReceived;
-        private Action _pendingLoginAction;
+        private bool      _waitingForSceneToLoad;
+        private string    _sessionNonce  = "";
+        private bool      _nonceReceived;
+        private Action    _pendingLoginAction;
+        private Coroutine _nonceWaitCoroutine;
 
         private void Awake()
         {
@@ -50,6 +56,19 @@ namespace RPG.Network
             NetworkClient.OnConnectedEvent    -= OnClientConnected;
             NetworkClient.OnDisconnectedEvent -= OnClientDisconnectedEvent;
             SceneManager.sceneLoaded          -= OnSceneLoaded;
+
+            StopAllPendingWork();
+        }
+
+        private void StopAllPendingWork()
+        {
+            if (_nonceWaitCoroutine != null)
+            {
+                StopCoroutine(_nonceWaitCoroutine);
+                _nonceWaitCoroutine = null;
+            }
+            _pendingLoginAction    = null;
+            _waitingForSceneToLoad = false;
         }
 
         // ── Conexão ────────────────────────────────────────────────────────
@@ -66,16 +85,17 @@ namespace RPG.Network
             NetworkClient.ReplaceHandler<MsgCharacterListResponse>  (OnCharacterListResponse);
             NetworkClient.ReplaceHandler<MsgCreateCharacterResponse>(OnCreateCharacterResponse);
             NetworkClient.ReplaceHandler<MsgSelectCharacterResponse>(OnSelectCharacterResponse);
-
-            Debug.Log("[ClientAuthHandler] Handlers registrados — aguardando challenge.");
         }
 
         private void OnClientDisconnectedEvent()
         {
-            _waitingForSceneToLoad = false;
-            _nonceReceived         = false;
-            _sessionNonce          = "";
-            _pendingLoginAction    = null;
+            // Cleanup completo de qualquer estado/coroutine pendente
+            StopAllPendingWork();
+
+            _nonceReceived = false;
+            _sessionNonce  = "";
+
+            // Desinscreve sceneLoaded para evitar trigger em cena que não chegou
             SceneManager.sceneLoaded -= OnSceneLoaded;
         }
 
@@ -91,11 +111,18 @@ namespace RPG.Network
             _sessionNonce  = msg.Nonce;
             _nonceReceived = true;
 
-            // Se havia login esperando o nonce, executa agora
             if (_pendingLoginAction != null)
             {
                 var action = _pendingLoginAction;
                 _pendingLoginAction = null;
+
+                // Cancela coroutine de espera (já temos o nonce)
+                if (_nonceWaitCoroutine != null)
+                {
+                    StopCoroutine(_nonceWaitCoroutine);
+                    _nonceWaitCoroutine = null;
+                }
+
                 action();
             }
         }
@@ -111,13 +138,14 @@ namespace RPG.Network
             }
 
             string baseHash = Managers.GameManager.HashPassword(password);
+            string user     = username; // captura local
 
             void DoSend()
             {
                 string signedHash = Managers.GameManager.HashPasswordWithNonce(baseHash, _sessionNonce);
                 NetworkClient.Send(new MsgLoginRequest
                 {
-                    Username   = username.Trim(),
+                    Username   = user.Trim(),
                     SignedHash = signedHash
                 });
             }
@@ -129,7 +157,12 @@ namespace RPG.Network
             else
             {
                 _pendingLoginAction = DoSend;
-                StartCoroutine(WaitForNonceThenLogin());
+
+                // Cancela coroutine anterior se houver (login chamado 2x antes do nonce)
+                if (_nonceWaitCoroutine != null)
+                    StopCoroutine(_nonceWaitCoroutine);
+
+                _nonceWaitCoroutine = StartCoroutine(WaitForNonceThenLogin());
             }
         }
 
@@ -141,6 +174,8 @@ namespace RPG.Network
                 elapsed += Time.deltaTime;
                 yield return null;
             }
+
+            _nonceWaitCoroutine = null;
 
             if (!_nonceReceived)
             {
