@@ -19,10 +19,18 @@ namespace RPG.Network
     ///   - GemSlotQ/W/E/R: SyncVars com IDs das Joias do Poder equipadas.
     ///
     /// Toda mutação passa por Commands e é validada no servidor.
+    ///
+    /// === SEGURANÇA ===
+    /// Toda operação de troca (equip/swap gem) segue o padrão SNAPSHOT → REMOVE NOVO →
+    /// DEVOLVE ANTIGO → APLICA NOVO. Isso garante que em caso de falha em qualquer
+    /// etapa, nada é duplicado e nada é perdido.
     /// </summary>
     [RequireComponent(typeof(NetworkIdentity))]
     public class NetworkInventory : NetworkBehaviour
     {
+        public const int MAX_INVENTORY_SLOTS = 60;
+        public const int GEM_SLOT_COUNT      = 4;
+
         // ── Sincronização ──────────────────────────────────────────────────
         public readonly SyncList<InventorySlotData> Slots         = new SyncList<InventorySlotData>();
         public readonly SyncList<EquippedItemData>  EquippedItems = new SyncList<EquippedItemData>();
@@ -67,6 +75,7 @@ namespace RPG.Network
 
         private IEnumerator BindUIDelayed()
         {
+            // 2 frames para garantir que a UI tenha terminado de inicializar
             yield return null;
             yield return null;
 
@@ -93,16 +102,27 @@ namespace RPG.Network
         // INVENTÁRIO — API do servidor
         // ══════════════════════════════════════════════════════════════════
 
-        /// <summary>Adiciona item. Retorna SlotIndex usado, ou -1 se falhou.</summary>
+        /// <summary>
+        /// Adiciona item. Retorna SlotIndex usado, ou -1 se falhou.
+        /// Falha se: itemId inválido, item não existe no banco, ou inventário cheio.
+        /// </summary>
         [Server]
         public int ServerAddItem(string itemId, int quantity = 1)
         {
             if (string.IsNullOrEmpty(itemId)) return -1;
+            if (quantity <= 0) return -1;
 
             var db = ItemDatabase.Instance;
             if (db == null || !db.Contains(itemId))
             {
-                Debug.LogWarning($"[NetworkInventory] Item '{itemId}' não existe.");
+                Debug.LogWarning($"[NetworkInventory] Item '{itemId}' não existe no banco.");
+                return -1;
+            }
+
+            // Limite de inventário — previne exploits e DoS
+            if (Slots.Count >= MAX_INVENTORY_SLOTS)
+            {
+                _netPlayer?.RpcShowMessageToOwner("Inventário cheio!");
                 return -1;
             }
 
@@ -147,6 +167,7 @@ namespace RPG.Network
 
         public bool HasItem(string itemId)
         {
+            if (string.IsNullOrEmpty(itemId)) return false;
             foreach (var slot in Slots)
                 if (slot.ItemId == itemId) return true;
             return false;
@@ -154,6 +175,7 @@ namespace RPG.Network
 
         public int FindSlotByItemId(string itemId)
         {
+            if (string.IsNullOrEmpty(itemId)) return -1;
             foreach (var slot in Slots)
                 if (slot.ItemId == itemId) return slot.SlotIndex;
             return -1;
@@ -172,11 +194,19 @@ namespace RPG.Network
             foreach (var row in rows)
             {
                 if (string.IsNullOrEmpty(row.ItemId)) continue;
+
+                // Valida que o item ainda existe (pode ter sido removido em patch)
+                if (ItemDatabase.Instance != null && !ItemDatabase.Instance.Contains(row.ItemId))
+                {
+                    Debug.LogWarning($"[NetworkInventory] Item '{row.ItemId}' do banco não está no ItemDatabase — ignorado.");
+                    continue;
+                }
+
                 var slot = new InventorySlotData
                 {
                     SlotIndex = row.SlotIndex >= 0 ? row.SlotIndex : _nextSlotIndex,
                     ItemId    = row.ItemId,
-                    Quantity  = row.Quantity
+                    Quantity  = Mathf.Max(1, row.Quantity)
                 };
                 Slots.Add(slot);
             }
@@ -192,10 +222,25 @@ namespace RPG.Network
             if (db == null) return;
 
             var loadout = db.LoadGemLoadout(characterId);
-            GemSlotQ = loadout.SlotQ ?? "";
-            GemSlotW = loadout.SlotW ?? "";
-            GemSlotE = loadout.SlotE ?? "";
-            GemSlotR = loadout.SlotR ?? "";
+            GemSlotQ = ValidateLoadedGemId(loadout.SlotQ);
+            GemSlotW = ValidateLoadedGemId(loadout.SlotW);
+            GemSlotE = ValidateLoadedGemId(loadout.SlotE);
+            GemSlotR = ValidateLoadedGemId(loadout.SlotR);
+        }
+
+        [Server]
+        private static string ValidateLoadedGemId(string gemId)
+        {
+            if (string.IsNullOrEmpty(gemId)) return "";
+            var db = ItemDatabase.Instance;
+            if (db == null) return gemId; // Sem como validar
+            var item = db.GetItem(gemId);
+            if (item == null || !item.IsPowerGem)
+            {
+                Debug.LogWarning($"[NetworkInventory] Gem '{gemId}' inválida no banco — slot limpo.");
+                return "";
+            }
+            return gemId;
         }
 
         [Server]
@@ -210,6 +255,15 @@ namespace RPG.Network
             foreach (var row in rows)
             {
                 if (string.IsNullOrEmpty(row.ItemId)) continue;
+
+                // Valida tipo
+                var itemData = ItemDatabase.Instance?.GetItem(row.ItemId);
+                if (itemData == null || !itemData.IsEquipment)
+                {
+                    Debug.LogWarning($"[NetworkInventory] Equipped item '{row.ItemId}' inválido — ignorado.");
+                    continue;
+                }
+
                 EquippedItems.Add(new EquippedItemData
                 {
                     Slot          = (byte)row.Slot,
@@ -229,8 +283,8 @@ namespace RPG.Network
             db.SaveInventory(characterId, username, new List<InventorySlotData>(Slots));
             db.SaveGemLoadout(characterId, new PowerGemLoadout
             {
-                SlotQ = GemSlotQ, SlotW = GemSlotW,
-                SlotE = GemSlotE, SlotR = GemSlotR
+                SlotQ = GemSlotQ ?? "", SlotW = GemSlotW ?? "",
+                SlotE = GemSlotE ?? "", SlotR = GemSlotR ?? ""
             });
             db.SaveEquipped(characterId, new List<EquippedItemData>(EquippedItems));
         }
@@ -281,6 +335,14 @@ namespace RPG.Network
             if (_netPlayer == null || _netPlayer.Dead) return;
 
             EquipmentSlot slot = (EquipmentSlot)slotByte;
+
+            // Valida que é um slot real
+            if (slot == EquipmentSlot.None || !EquipmentSlotEx.IsActive(slot))
+            {
+                _netPlayer.RpcShowMessageToOwner("Slot inválido.");
+                return;
+            }
+
             int idx = ServerFindEquippedIndex(slot);
             if (idx < 0)
             {
@@ -291,16 +353,17 @@ namespace RPG.Network
             string itemId = EquippedItems[idx].ItemId;
             if (string.IsNullOrEmpty(itemId))
             {
+                // Estado corrompido — limpa
                 EquippedItems.RemoveAt(idx);
                 _netPlayer.ServerOnEquipmentChanged();
                 return;
             }
 
-            // Devolve ao inventário ANTES de remover do slot equipado
+            // Tenta adicionar ao inventário ANTES de remover do slot equipado
             int returnedSlot = ServerAddItem(itemId, 1);
             if (returnedSlot < 0)
             {
-                _netPlayer.RpcShowMessageToOwner("Inventário cheio — não foi possível desequipar.");
+                // ServerAddItem já mostra mensagem se for inventário cheio
                 return;
             }
 
@@ -311,16 +374,15 @@ namespace RPG.Network
         /// <summary>
         /// Equipa um item do inventário no slot escolhido (ou no slot natural se None).
         ///
-        /// Ordem (atômica do ponto de vista do jogador):
-        ///   1. Valida o item, o slot e os requisitos.
-        ///   2. Lê dados do item antigo (se houver) ANTES de qualquer mutação.
-        ///   3. Remove o item novo do inventário.
-        ///   4. Devolve o item antigo ao inventário (se houver swap).
-        ///   5. Atualiza EquippedItems.
-        ///   6. Notifica o player para recalcular stats.
+        /// === ORDEM SEGURA (anti-duplicação) ===
+        ///   1. Valida o item, o slot e os requisitos
+        ///   2. Snapshot do item antigo (se houver) ANTES de qualquer mutação
+        ///   3. Remove o item novo do inventário (libera 1 slot)
+        ///   4. Devolve o item antigo ao inventário (não pode falhar — slot livre)
+        ///   5. Substitui o equipado
+        ///   6. Notifica o player para recalcular stats
         ///
-        /// Esta ordem garante que o item novo nunca apareça duplicado e o item
-        /// antigo nunca seja perdido.
+        /// Em caso de qualquer falha durante o pipeline, faz rollback total.
         /// </summary>
         [Server]
         private void ServerEquipItem(int inventorySlotIndex, byte targetSlotByte)
@@ -370,10 +432,17 @@ namespace RPG.Network
             }
 
             // 5) Snapshot do item antigo (se houver) ANTES de qualquer mutação
-            int    existingIdx    = ServerFindEquippedIndex(targetSlot);
-            string oldItemId      = "";
+            int    existingIdx = ServerFindEquippedIndex(targetSlot);
+            string oldItemId   = "";
+            int    oldDurability = -1;
+            int    oldMaxDurability = 0;
             if (existingIdx >= 0)
-                oldItemId = EquippedItems[existingIdx].ItemId;
+            {
+                var existing = EquippedItems[existingIdx];
+                oldItemId        = existing.ItemId;
+                oldDurability    = existing.Durability;
+                oldMaxDurability = existing.MaxDurability;
+            }
 
             // 6) Mutações em ordem segura:
             //    a) Remove o item NOVO do inventário primeiro (libera slot).
@@ -383,7 +452,8 @@ namespace RPG.Network
 
             if (!ServerRemoveSlot(inventorySlotIndex))
             {
-                Debug.LogError($"[NetworkInventory] ServerRemoveSlot({inventorySlotIndex}) falhou.");
+                Debug.LogError($"[NetworkInventory] ServerRemoveSlot({inventorySlotIndex}) falhou — abortando.");
+                _netPlayer.RpcShowMessageToOwner("Erro interno ao equipar.");
                 return;
             }
 
@@ -393,9 +463,20 @@ namespace RPG.Network
                 if (returnedSlot < 0)
                 {
                     // Caso patológico (item antigo não existe mais no banco).
-                    // Devolve o item novo ao inventário e cancela.
-                    Debug.LogError($"[NetworkInventory] Item antigo '{oldItemId}' não pôde voltar — abortando swap.");
-                    ServerAddItem(itemData.ItemId, 1);
+                    // ROLLBACK: devolve o item novo ao inventário e cancela.
+                    Debug.LogError($"[NetworkInventory] Item antigo '{oldItemId}' não pôde voltar — rollback.");
+                    int rollback = ServerAddItem(itemData.ItemId, 1);
+                    if (rollback < 0)
+                    {
+                        // Inventário cheio: criamos um slot manualmente para garantir que o item não suma
+                        // Isso pode acontecer apenas em corrida extrema; vamos forçar a inserção mesmo assim
+                        Slots.Add(new InventorySlotData
+                        {
+                            SlotIndex = _nextSlotIndex++,
+                            ItemId    = itemData.ItemId,
+                            Quantity  = 1
+                        });
+                    }
                     _netPlayer.RpcShowMessageToOwner("Erro ao trocar equipamento.");
                     return;
                 }
@@ -483,36 +564,83 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // JOIAS DO PODER — Commands
+        // JOIAS DO PODER — Commands (CORRIGIDO: anti-duplicação + validação)
         // ══════════════════════════════════════════════════════════════════
 
         [Command]
         public void CmdEquipGem(int skillSlotIndex, int inventorySlotIndex)
         {
-            if (skillSlotIndex < 0 || skillSlotIndex > 3) return;
+            if (_netPlayer == null || _netPlayer.Dead) return;
 
-            if (!TryGetInventorySlot(inventorySlotIndex, out var foundSlot)) return;
+            if (skillSlotIndex < 0 || skillSlotIndex >= GEM_SLOT_COUNT)
+            {
+                _netPlayer.RpcShowMessageToOwner("Slot de joia inválido.");
+                return;
+            }
+
+            // 1) Valida que existe e é PowerGem
+            if (!TryGetInventorySlot(inventorySlotIndex, out var foundSlot))
+            {
+                _netPlayer.RpcShowMessageToOwner("Joia não encontrada no inventário.");
+                return;
+            }
 
             var itemData = ItemDatabase.Instance?.GetItem(foundSlot.ItemId);
-            if (itemData == null || !itemData.IsPowerGem) return;
+            if (itemData == null || !itemData.IsPowerGem)
+            {
+                _netPlayer.RpcShowMessageToOwner("Este item não é uma Joia do Poder.");
+                return;
+            }
 
-            // Snapshot da joia antiga
-            string currentGemId = GetGemItemId(skillSlotIndex);
+            // 2) Snapshot da joia antiga ANTES de qualquer mutação
+            string oldGemId = GetGemItemId(skillSlotIndex);
 
-            // Remove a joia nova do inventário
-            ServerRemoveSlot(inventorySlotIndex);
+            // 3) Remove a joia nova do inventário (libera 1 slot)
+            if (!ServerRemoveSlot(inventorySlotIndex))
+            {
+                Debug.LogError("[NetworkInventory] CmdEquipGem: ServerRemoveSlot falhou.");
+                _netPlayer.RpcShowMessageToOwner("Erro interno.");
+                return;
+            }
 
-            // Devolve a joia antiga (se houver)
-            if (!string.IsNullOrEmpty(currentGemId))
-                ServerAddItem(currentGemId, 1);
+            // 4) Devolve a joia antiga (se houver) — não pode falhar pois liberamos espaço
+            if (!string.IsNullOrEmpty(oldGemId))
+            {
+                int returnedSlot = ServerAddItem(oldGemId, 1);
+                if (returnedSlot < 0)
+                {
+                    // Caso patológico: rollback total
+                    Debug.LogError($"[NetworkInventory] CmdEquipGem: joia antiga '{oldGemId}' não pôde voltar — rollback.");
+                    int rollback = ServerAddItem(itemData.ItemId, 1);
+                    if (rollback < 0)
+                    {
+                        // Força inserção pra não perder o item
+                        Slots.Add(new InventorySlotData
+                        {
+                            SlotIndex = _nextSlotIndex++,
+                            ItemId    = itemData.ItemId,
+                            Quantity  = 1
+                        });
+                    }
+                    _netPlayer.RpcShowMessageToOwner("Erro ao trocar joia.");
+                    return;
+                }
+            }
 
-            ServerSetGemSlot(skillSlotIndex, foundSlot.ItemId);
+            // 5) Aplica a nova joia
+            ServerSetGemSlot(skillSlotIndex, itemData.ItemId);
         }
 
         [Command]
         public void CmdUnequipGem(int skillSlotIndex)
         {
-            if (skillSlotIndex < 0 || skillSlotIndex > 3) return;
+            if (_netPlayer == null || _netPlayer.Dead) return;
+
+            if (skillSlotIndex < 0 || skillSlotIndex >= GEM_SLOT_COUNT)
+            {
+                _netPlayer.RpcShowMessageToOwner("Slot inválido.");
+                return;
+            }
 
             string gemId = GetGemItemId(skillSlotIndex);
             if (string.IsNullOrEmpty(gemId)) return;
@@ -520,7 +648,7 @@ namespace RPG.Network
             int newSlot = ServerAddItem(gemId, 1);
             if (newSlot < 0)
             {
-                Debug.LogError($"[NetworkInventory] Falha ao devolver '{gemId}' ao inventário.");
+                // ServerAddItem já mostra "Inventário cheio"
                 return;
             }
 
@@ -532,10 +660,10 @@ namespace RPG.Network
         {
             switch (index)
             {
-                case 0: GemSlotQ = itemId; break;
-                case 1: GemSlotW = itemId; break;
-                case 2: GemSlotE = itemId; break;
-                case 3: GemSlotR = itemId; break;
+                case 0: GemSlotQ = itemId ?? ""; break;
+                case 1: GemSlotW = itemId ?? ""; break;
+                case 2: GemSlotE = itemId ?? ""; break;
+                case 3: GemSlotR = itemId ?? ""; break;
             }
         }
 
@@ -546,22 +674,26 @@ namespace RPG.Network
         [Command]
         public void CmdRemoveItem(int inventorySlotIndex)
         {
+            if (_netPlayer == null || _netPlayer.Dead) return;
             ServerRemoveSlot(inventorySlotIndex);
         }
 
         [Command]
         public void CmdUseConsumable(int inventorySlotIndex)
         {
+            if (_netPlayer == null || _netPlayer.Dead) return;
+
             if (!TryGetInventorySlot(inventorySlotIndex, out var foundSlot)) return;
 
             var itemData = ItemDatabase.Instance?.GetItem(foundSlot.ItemId);
             if (itemData == null || !itemData.IsConsumable) return;
 
-            if (_netPlayer == null || _netPlayer.Dead) return;
-
+            // Aplica efeitos
             if (itemData.HealAmount > 0f) _netPlayer.ServerApplyHeal(itemData.HealAmount);
             if (itemData.ManaAmount > 0f) _netPlayer.ServerRestoreMP(itemData.ManaAmount);
 
+            // Remove APÓS aplicar (se o jogador for desconectado entre as duas operações,
+            // o item já foi consumido em memória mas será restaurado do banco — aceitável)
             ServerRemoveSlot(foundSlot.SlotIndex);
         }
 
@@ -588,7 +720,7 @@ namespace RPG.Network
         public int EquippedGemCount()
         {
             int count = 0;
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < GEM_SLOT_COUNT; i++)
                 if (!string.IsNullOrEmpty(GetGemItemId(i))) count++;
             return count;
         }
@@ -601,5 +733,7 @@ namespace RPG.Network
             => EquipmentSlotEx.AggregateBonuses(EquippedItems);
 
         public int EquippedItemCount() => EquippedItems.Count;
+        public int FreeSlotCount() => Mathf.Max(0, MAX_INVENTORY_SLOTS - Slots.Count);
+        public bool IsFull() => Slots.Count >= MAX_INVENTORY_SLOTS;
     }
 }

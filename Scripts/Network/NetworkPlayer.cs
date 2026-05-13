@@ -21,11 +21,12 @@ namespace RPG.Network
     ///   - Aplica dano, cura, regen, level up, morte e respawn.
     ///   - Persiste no banco em intervalos e em eventos importantes.
     ///
-    /// Princípios:
+    /// === PRINCÍPIOS ===
     ///   - Toda mudança que afeta stats derivados passa por ServerRecalculateStats.
     ///   - DerivedStats é substituído atomicamente (clone) — leitores nunca veem
     ///     estado intermediário.
     ///   - Cliente só faz prediction/UX. Servidor é a única fonte da verdade.
+    ///   - Dano é sempre sanitizado (Mathf.Max(0, dmg), sem NaN/Infinity).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -60,7 +61,7 @@ namespace RPG.Network
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnNetNameChanged))]       public string CharacterName         = "...";
-        [SyncVar]                                         public string RaceStr               = "Human";
+        [SyncVar(hook = nameof(OnRaceStrChanged))]       public string RaceStr               = "Human";
         [SyncVar(hook = nameof(OnNetLevelChanged))]      public int    Level                 = 1;
 
         [SyncVar(hook = nameof(OnNetMaxHPChanged))]      public float  MaxHP                 = 1f;
@@ -129,7 +130,6 @@ namespace RPG.Network
 
         // ── Cache de raça ──────────────────────────────────────────────────
         // Parse de RaceStr é feito UMA vez por sincronização (no hook).
-        // Antes era feito repetidamente em validações de equipamento (hot path).
         private CharacterRace _cachedRace = CharacterRace.Human;
 
         // ── Estado do cliente ──────────────────────────────────────────────
@@ -271,15 +271,16 @@ namespace RPG.Network
             CharacterName         = charData.CharacterName;
             RaceStr               = charData.Race.ToString();
             Level                 = charData.Level;
-            Experience            = charData.Experience;
-            ExperienceToNextLevel = charData.ExperienceToNextLevel;
-            FreeAttributePoints   = charData.FreeAttributePoints;
-            AllocatedSTR          = charData.AllocatedSTR;
-            AllocatedAGI          = charData.AllocatedAGI;
-            AllocatedVIT          = charData.AllocatedVIT;
-            AllocatedDEX          = charData.AllocatedDEX;
-            AllocatedINT          = charData.AllocatedINT;
-            AllocatedLUK          = charData.AllocatedLUK;
+            Experience            = Math.Max(0L, charData.Experience);
+            ExperienceToNextLevel = Math.Max(0L, charData.ExperienceToNextLevel);
+            FreeAttributePoints   = Mathf.Clamp(charData.FreeAttributePoints, 0, MAX_FREE_POINTS);
+            AllocatedSTR          = Mathf.Clamp(charData.AllocatedSTR, 0, CharacterData.MAX_ALLOCATED_PER_STAT);
+            AllocatedAGI          = Mathf.Clamp(charData.AllocatedAGI, 0, CharacterData.MAX_ALLOCATED_PER_STAT);
+            AllocatedVIT          = Mathf.Clamp(charData.AllocatedVIT, 0, CharacterData.MAX_ALLOCATED_PER_STAT);
+            AllocatedDEX          = Mathf.Clamp(charData.AllocatedDEX, 0, CharacterData.MAX_ALLOCATED_PER_STAT);
+            AllocatedINT          = Mathf.Clamp(charData.AllocatedINT, 0, CharacterData.MAX_ALLOCATED_PER_STAT);
+            AllocatedLUK          = Mathf.Clamp(charData.AllocatedLUK, 0, CharacterData.MAX_ALLOCATED_PER_STAT);
+
             BaseSTR = charData.BaseAttributes.STR;
             BaseAGI = charData.BaseAttributes.AGI;
             BaseVIT = charData.BaseAttributes.VIT;
@@ -324,6 +325,9 @@ namespace RPG.Network
         [Server]
         private IEnumerator SendInitRpcDelayed(CharacterData charData)
         {
+            // 3 frames para garantir que a SyncList do inventário tenha sido
+            // sincronizada ANTES do RPC de inicialização (evita race condition)
+            yield return null;
             yield return null;
             yield return null;
 
@@ -517,11 +521,22 @@ namespace RPG.Network
         public void CmdRequestSelfSkill(int skillIndex)
         {
             if (Dead || _serverStats == null) return;
+            if (skillIndex < 0 || skillIndex >= NetworkInventory.GEM_SLOT_COUNT) return;
 
             var skill = _inventory?.GetEquippedSkill(skillIndex);
             if (skill == null)
             {
                 RpcSkillRejected(skillIndex, "Nenhuma joia equipada neste slot.");
+                return;
+            }
+
+            // Verifica que essa skill é REALMENTE self/buff/heal
+            // (proteção contra cliente tentar usar skill de alvo como self)
+            if (skill.Target != Combat.SkillTarget.Self
+                && skill.Type != Combat.SkillType.Heal
+                && skill.Type != Combat.SkillType.Buff)
+            {
+                RpcSkillRejected(skillIndex, "Esta skill precisa de um alvo.");
                 return;
             }
 
@@ -540,9 +555,10 @@ namespace RPG.Network
 
             ServerConsumeMP(skill.ManaCost);
 
-            if (skill.Type == SkillType.Heal)
+            if (skill.Type == Combat.SkillType.Heal)
             {
                 float heal   = Mathf.Max(10f, _serverStats.MATK * skill.AtkMultiplier);
+                heal = SanitizeAmount(heal);
                 float before = CurrentHP;
                 CurrentHP    = Mathf.Min(MaxHP, CurrentHP + heal);
                 float healed = CurrentHP - before;
@@ -558,10 +574,23 @@ namespace RPG.Network
         // Métodos do servidor (chamados por outros sistemas)
         // ══════════════════════════════════════════════════════════════════
 
+        /// <summary>
+        /// Sanitiza valor (não pode ser NaN/Infinity/negativo).
+        /// Usado em toda operação de cura/dano/MP.
+        /// </summary>
+        private static float SanitizeAmount(float v)
+        {
+            if (float.IsNaN(v) || float.IsInfinity(v)) return 0f;
+            return Mathf.Max(0f, v);
+        }
+
         [Server]
         public void ServerApplyDamage(float dmg)
         {
             if (Dead) return;
+            dmg = SanitizeAmount(dmg);
+            if (dmg <= 0f) return;
+
             _lastDamageTime = Time.time;
             CurrentHP = Mathf.Max(0f, CurrentHP - dmg);
             if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
@@ -572,6 +601,9 @@ namespace RPG.Network
         public void ServerApplyDamageWithFeedback(float dmg)
         {
             if (Dead) return;
+            dmg = SanitizeAmount(dmg);
+            if (dmg <= 0f) return;
+
             _lastDamageTime = Time.time;
             float before    = CurrentHP;
             CurrentHP       = Mathf.Max(0f, CurrentHP - dmg);
@@ -585,7 +617,10 @@ namespace RPG.Network
         [Server]
         public void ServerApplyHeal(float amount)
         {
-            if (Dead || amount <= 0f) return;
+            if (Dead) return;
+            amount = SanitizeAmount(amount);
+            if (amount <= 0f) return;
+
             float before = CurrentHP;
             CurrentHP    = Mathf.Min(MaxHP, CurrentHP + amount);
             float healed = CurrentHP - before;
@@ -597,7 +632,10 @@ namespace RPG.Network
         [Server]
         public void ServerRestoreMP(float amount)
         {
-            if (Dead || amount <= 0f) return;
+            if (Dead) return;
+            amount = SanitizeAmount(amount);
+            if (amount <= 0f) return;
+
             CurrentMP = Mathf.Min(MaxMP, CurrentMP + amount);
             if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
         }
@@ -605,6 +643,7 @@ namespace RPG.Network
         [Server]
         public void ServerConsumeMP(float amount)
         {
+            amount = SanitizeAmount(amount);
             CurrentMP = Mathf.Max(0f, CurrentMP - amount);
             if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
         }
@@ -612,6 +651,9 @@ namespace RPG.Network
         [Server]
         public bool ServerCheckAndSetCooldown(int skillIndex, float cooldownDuration)
         {
+            if (cooldownDuration <= 0f) return true; // sem cooldown
+            cooldownDuration = Mathf.Min(cooldownDuration, 300f); // cap de 5min defensivo
+
             if (_serverSkillCooldowns.TryGetValue(skillIndex, out float endTime) && Time.time < endTime)
                 return false;
             _serverSkillCooldowns[skillIndex] = Time.time + cooldownDuration;
@@ -622,6 +664,8 @@ namespace RPG.Network
         public void ServerGrantExp(long amount)
         {
             if (_serverCharData == null || amount <= 0) return;
+            // Cap defensivo: evita overflow se servidor for hackeado
+            amount = Math.Min(amount, 1_000_000L);
 
             bool leveledUp = _serverCharData.AddExperience(amount);
 
@@ -720,6 +764,8 @@ namespace RPG.Network
                     STR = d.BaseSTR, AGI = d.BaseAGI, VIT = d.BaseVIT,
                     DEX = d.BaseDEX, INT = d.BaseINT, LUK = d.BaseLUK
                 },
+                // Inicia com bonus zero — será atualizado por OnStatsVersionChanged
+                // assim que a SyncList do inventário chegar (ou via _equipDirty)
                 EquipmentBonuses = _inventory != null
                     ? _inventory.BuildEquipmentBonuses()
                     : new EquipmentBonuses()
@@ -750,6 +796,10 @@ namespace RPG.Network
                     yield break;
                 }
             }
+
+            // Re-agrega os bônus agora que tudo deve estar sincronizado
+            if (_inventory != null)
+                data.EquipmentBonuses = _inventory.BuildEquipmentBonuses();
 
             _playerEntity.InitializeFromServer(data);
             UIManager.Instance?.BindLocalPlayer(_playerEntity);
@@ -915,6 +965,12 @@ namespace RPG.Network
         private void OnNetNameChanged(string _, string v)
         {
             if (_nameTagText != null) _nameTagText.text = v;
+        }
+
+        private void OnRaceStrChanged(string _, string __)
+        {
+            // Atualiza cache de raça quando RaceStr muda
+            UpdateCachedRace();
         }
 
         private void OnNetMaxHPChanged(float _, float newMax)

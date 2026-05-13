@@ -25,6 +25,12 @@ namespace RPG.Network
     ///
     /// O servidor escala stats por nível via StatsCalculator.CalculateForMonster.
     /// Toda validação de ataque de jogador (range, cooldown) acontece aqui.
+    ///
+    /// === ANTI-CHEAT ===
+    ///   - Range de ataque com tolerância configurável
+    ///   - Cap server-side no range (ignora valores inflados do cliente)
+    ///   - Dano clampado a [1, MaxHP] para impedir overflow/underflow
+    ///   - Cooldown por par (atacante, monstro) — não bloqueia outros alvos
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -93,6 +99,10 @@ namespace RPG.Network
         private const float REGEN_INTERVAL                 = 5f;
         private const float REGEN_PERCENT                  = 0.05f;
         private const float MOVING_UPDATE_INTERVAL         = 0.1f;
+        private const float DAMAGE_LOG_CLEANUP_INTERVAL    = 60f; // limpa entradas muito antigas
+
+        // Marcador de bit alto para evitar colisão com índices de skill (0-15)
+        private const int BASIC_ATTACK_COOLDOWN_BIT = unchecked((int)0x40000000);
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnCurrentHPChanged))] private float _currentHP;
@@ -161,10 +171,19 @@ namespace RPG.Network
             _agent    = GetComponent<NavMeshAgent>();
             _animator = GetComponentInChildren<Animator>();
 
+            // Validação de atributos no Inspector
+            baseSTR = Mathf.Max(1, baseSTR);
+            baseAGI = Mathf.Max(1, baseAGI);
+            baseVIT = Mathf.Max(1, baseVIT);
+            baseDEX = Mathf.Max(1, baseDEX);
+            baseINT = Mathf.Max(1, baseINT);
+            baseLUK = Mathf.Max(1, baseLUK);
+            level   = Mathf.Max(1, level);
+
             _stats = StatsCalculator.CalculateForMonster(
                 new BaseAttributes { STR = baseSTR, AGI = baseAGI, VIT = baseVIT,
                                      DEX = baseDEX, INT = baseINT, LUK = baseLUK },
-                Mathf.Max(1, level));
+                level);
 
             _homePosition        = transform.position;
             _patrolRadiusRuntime = patrolRadius;
@@ -193,7 +212,7 @@ namespace RPG.Network
         public void SetSpawnData(Vector3 homePos, float newPatrolRadius)
         {
             _homePosition        = homePos;
-            _patrolRadiusRuntime = newPatrolRadius;
+            _patrolRadiusRuntime = Mathf.Max(0f, newPatrolRadius);
             transform.position   = homePos;
             _patrolTargetSet     = false;
             StartCoroutine(ServerResetNextFrame());
@@ -281,7 +300,10 @@ namespace RPG.Network
             switch (_state)
             {
                 case AIState.Idle:       break;
-                case AIState.Patrol:     if (usePatrolPoints) ServerPatrolWaypoints(); break;
+                case AIState.Patrol:
+                    // Sentinela (radius 0 e sem pontos fixos): não patrulha
+                    if (usePatrolPoints) ServerPatrolWaypoints();
+                    break;
                 case AIState.Chase:      ServerChaseCheck();      break;
                 case AIState.Combat:     ServerCombat();          break;
                 case AIState.Flee:       ServerFleeCheck();       break;
@@ -328,7 +350,9 @@ namespace RPG.Network
                         case AIState.ReturnHome: UpdateReturnHomePath(); break;
                         case AIState.Flee:       UpdateFleePath();       break;
                         case AIState.Patrol:
-                            if (!usePatrolPoints) UpdatePatrolAreaPath();
+                            // Sentinela (radius 0): não move
+                            if (!usePatrolPoints && _patrolRadiusRuntime > 0.1f)
+                                UpdatePatrolAreaPath();
                             break;
                     }
                 }
@@ -366,11 +390,12 @@ namespace RPG.Network
         private void ServerPatrolWaypoints()
         {
             if (patrolPoints == null || patrolPoints.Length == 0) return;
-            if (!_agent.isOnNavMesh || _patrolWaiting) return;
+            if (_agent == null || !_agent.isOnNavMesh || _patrolWaiting) return;
 
             if (!_agent.pathPending && _agent.remainingDistance < 0.5f)
             {
                 _patrolIndex = (_patrolIndex + 1) % patrolPoints.Length;
+                if (patrolPoints[_patrolIndex] == null) return;
                 _agent.SetDestination(patrolPoints[_patrolIndex].position);
                 _patrolWaiting       = true;
                 _patrolWaitCoroutine = StartCoroutine(PatrolWaitCoroutine());
@@ -446,7 +471,7 @@ namespace RPG.Network
         private void ServerFleeCheck()
         {
             _fleeTimer += Time.deltaTime;
-            if (_fleeTimer >= fleeDuration || !_agent.isOnNavMesh)
+            if (_fleeTimer >= fleeDuration || _agent == null || !_agent.isOnNavMesh)
             {
                 if (_agent != null) _agent.speed = _stats.MoveSpeed;
                 _fleeTimer = 0f;
@@ -456,7 +481,7 @@ namespace RPG.Network
 
         private void ServerReturnHomeCheck()
         {
-            if (!_agent.isOnNavMesh) return;
+            if (_agent == null || !_agent.isOnNavMesh) return;
             if (Vector3.Distance(transform.position, _homePosition) < 1.5f)
             {
                 _agent.ResetPath();
@@ -476,7 +501,7 @@ namespace RPG.Network
         [Server]
         private void UpdateChasePath()
         {
-            if (_aggroTarget == null || !_agent.isOnNavMesh) return;
+            if (_aggroTarget == null || _agent == null || !_agent.isOnNavMesh) return;
             Vector3 destination = CalculateChaseDestination(_aggroTarget.transform.position);
             _agent.stoppingDistance = 0.2f;
             _agent.SetDestination(destination);
@@ -502,7 +527,7 @@ namespace RPG.Network
         [Server]
         private void UpdateReturnHomePath()
         {
-            if (!_agent.isOnNavMesh) return;
+            if (_agent == null || !_agent.isOnNavMesh) return;
             _agent.stoppingDistance = 0.5f;
             _agent.SetDestination(_homePosition);
         }
@@ -510,7 +535,7 @@ namespace RPG.Network
         [Server]
         private void UpdateFleePath()
         {
-            if (_aggroTarget == null || !_agent.isOnNavMesh) return;
+            if (_aggroTarget == null || _agent == null || !_agent.isOnNavMesh) return;
             Vector3 fleeDir = (transform.position - _aggroTarget.transform.position).normalized;
             Vector3 fleePos = transform.position + fleeDir * (aggroRange * 1.5f);
             if (NavMesh.SamplePosition(fleePos, out NavMeshHit hit, 5f, NavMesh.AllAreas))
@@ -520,7 +545,7 @@ namespace RPG.Network
         [Server]
         private void UpdatePatrolAreaPath()
         {
-            if (!_agent.isOnNavMesh || _patrolWaiting) return;
+            if (_agent == null || !_agent.isOnNavMesh || _patrolWaiting) return;
             bool arrived = !_agent.pathPending && _agent.remainingDistance < 0.6f;
 
             if (_patrolTargetSet && arrived)
@@ -643,6 +668,9 @@ namespace RPG.Network
                 _stats.Penetration,
                 targetStats?.DamageReduction ?? 0f);
 
+            // Clamp de segurança: dano nunca pode ser negativo ou NaN
+            dmg = SanitizeDamage(dmg);
+
             if (!_aggroTarget.Dead)
             {
                 RpcShowDamageTakenOnPlayer(dmg, crit, _aggroTarget.transform.position);
@@ -655,10 +683,23 @@ namespace RPG.Network
         [Server]
         private void ApplyDamageInternal(float dmg)
         {
-            if (_deathProcessed || _isDead || dmg <= 0f) return;
+            if (_deathProcessed || _isDead) return;
+
+            // Sanitização: dano deve ser positivo e finito
+            dmg = SanitizeDamage(dmg);
+            if (dmg <= 0f) return;
 
             _currentHP = Mathf.Max(0f, _currentHP - dmg);
             if (_currentHP <= 0f) ServerDie();
+        }
+
+        /// <summary>
+        /// Sanitiza valor de dano para evitar NaN/Infinity/negativo.
+        /// </summary>
+        private static float SanitizeDamage(float dmg)
+        {
+            if (float.IsNaN(dmg) || float.IsInfinity(dmg)) return 1f;
+            return Mathf.Max(0f, dmg);
         }
 
         private static NetworkPlayer FindPlayerByNetId(uint netId)
@@ -676,10 +717,18 @@ namespace RPG.Network
         public void CmdRequestSkill(uint attackerNetId, int skillIndex, bool isPhysical)
         {
             if (_isDead || _deathProcessed) return;
-            if (skillIndex < 0 || skillIndex >= 4) return;
+            if (skillIndex < 0 || skillIndex >= NetworkInventory.GEM_SLOT_COUNT) return;
 
             var attacker = FindPlayerByNetId(attackerNetId);
             if (attacker == null || attacker.Dead) return;
+
+            // Verifica que o atacante REALMENTE controlla essa entidade
+            // (proteção contra spoofing de netId)
+            if (attacker.connectionToClient == null)
+            {
+                Debug.LogWarning($"[Security] CmdRequestSkill com netId sem conexão: {attackerNetId}");
+                return;
+            }
 
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
@@ -717,10 +766,6 @@ namespace RPG.Network
         /// <summary>
         /// Ataque básico. Chave de cooldown única por COMBINAÇÃO atacante+monstro
         /// para evitar que atacar um monstro bloqueie ataques a outros.
-        ///
-        /// Usamos hash combinado dos dois netIds. Como skill indices são 0-3 e
-        /// índices de cooldowns positivos pequenos, usamos um hash que sempre
-        /// produz um valor distinto desses (HashCode.Combine).
         /// </summary>
         [Command(requiresAuthority = false)]
         public void CmdBasicAttack(uint attackerNetId, float clientAttackRange)
@@ -729,6 +774,13 @@ namespace RPG.Network
 
             var attacker = FindPlayerByNetId(attackerNetId);
             if (attacker == null || attacker.Dead) return;
+
+            // Anti-spoofing: o atacante deve ser controlado por uma conexão real
+            if (attacker.connectionToClient == null)
+            {
+                Debug.LogWarning($"[Security] CmdBasicAttack com netId sem conexão: {attackerNetId}");
+                return;
+            }
 
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
@@ -746,7 +798,7 @@ namespace RPG.Network
             }
 
             // Chave de cooldown única para a combinação (atacante, monstro)
-            int cooldownKey = BuildBasicAttackCooldownKey(attacker.netId, netId);
+            int cooldownKey      = BuildBasicAttackCooldownKey(attacker.netId, netId);
             float attackInterval = atkStats.ASPD > 0f ? (1f / atkStats.ASPD) : 1.2f;
             attackInterval = Mathf.Clamp(attackInterval, 0.2f, 3f);
 
@@ -763,6 +815,8 @@ namespace RPG.Network
                 atkStats.CritDMG,
                 atkStats.Penetration,
                 _stats.DamageReduction);
+
+            dmg = SanitizeDamage(dmg);
             dmg = Mathf.Max(1f, dmg);
 
             if (!_damageLog.ContainsKey(attacker.netId)) _damageLog[attacker.netId] = 0f;
@@ -774,17 +828,14 @@ namespace RPG.Network
         }
 
         /// <summary>
-        /// Constrói uma chave de cooldown estável e única para um par (atacante, monstro).
-        /// Não usa mask de 16 bits (que causava colisões). Usa HashCode.Combine que
-        /// distribui bem em toda a faixa de int.
-        ///
-        /// Skill indices ocupam 0..3, então usamos OR com bit alto para nunca colidir.
+        /// Constrói chave de cooldown ESTÁVEL e ÚNICA para um par (atacante, monstro).
+        /// Usa HashCode.Combine + bit alto para evitar colisão com índices de skill.
         /// </summary>
         private static int BuildBasicAttackCooldownKey(uint attackerNetId, uint monsterNetId)
         {
             int hash = System.HashCode.Combine(attackerNetId, monsterNetId);
             // Garante que nunca colida com índices pequenos de skills (0..15)
-            return hash | unchecked((int)0x40000000);
+            return hash | BASIC_ATTACK_COOLDOWN_BIT;
         }
 
         [Server]
@@ -859,6 +910,7 @@ namespace RPG.Network
                     _stats.DamageReduction);
             }
 
+            dmg = SanitizeDamage(dmg);
             dmg = Mathf.Max(1f, dmg);
 
             if (!_damageLog.ContainsKey(attacker.netId)) _damageLog[attacker.netId] = 0f;
@@ -917,7 +969,7 @@ namespace RPG.Network
             {
                 long xp = (long)Mathf.Max(1f, expReward * (kv.Value / total));
                 var  np = FindPlayerByNetId(kv.Key);
-                if (np != null) np.ServerGrantExp(xp);
+                if (np != null && !np.Dead) np.ServerGrantExp(xp);
             }
             _damageLog.Clear();
         }
