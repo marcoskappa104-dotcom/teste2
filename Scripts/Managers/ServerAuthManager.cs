@@ -12,16 +12,25 @@ namespace RPG.Network
     /// Mantém sessões por connectionId e processa requisições de login,
     /// criação de conta, listagem e seleção de personagem.
     ///
-    /// Limpa sessões ociosas (Unauthenticated/Authenticated) por TTL.
-    /// Sessões InGame só são removidas em OnServerDisconnect.
+    /// === SEGURANÇA ===
+    /// Implementa:
+    ///   - Rate limit por conexão (LoginAttempts)
+    ///   - Rate limit por endereço IP (sobrevive a reconexão)
+    ///   - Throttle entre tentativas (delay incremental)
+    ///   - Limpeza de sessões ociosas por TTL
+    ///   - Sessões InGame protegidas contra timeout
     /// </summary>
     public class ServerAuthManager : MonoBehaviour
     {
         public static ServerAuthManager Instance { get; private set; }
 
-        private const int   LOGIN_MAX_ATTEMPTS  = 5;
-        private const float SESSION_TTL_SECONDS = 300f; // 5 min sem atividade
-        private const float CLEANUP_INTERVAL    = 60f;
+        // ── Tuning de segurança ────────────────────────────────────────────
+        private const int   LOGIN_MAX_ATTEMPTS_PER_CONN = 5;
+        private const int   LOGIN_MAX_ATTEMPTS_PER_IP   = 15;
+        private const float IP_BAN_DURATION_SECONDS    = 300f; // 5 minutos
+        private const float SESSION_TTL_SECONDS        = 300f; // 5 min sem atividade
+        private const float CLEANUP_INTERVAL           = 60f;
+        private const float MIN_TIME_BETWEEN_LOGINS    = 0.5f;
 
         [Header("Debug")]
         [Tooltip("Logs detalhados do fluxo de auth. DESATIVE em produção.")]
@@ -38,11 +47,21 @@ namespace RPG.Network
             public int         LoginAttempts;
             public string      SessionNonce    = "";
             public float       LastActivityTime;
+            public float       LastLoginAttemptTime = -999f;
+            public string      RemoteAddress    = "";
 
             public ConnData() => LastActivityTime = Time.time;
         }
 
-        private readonly Dictionary<int, ConnData> _sessions = new();
+        private class IpData
+        {
+            public int   FailedAttempts;
+            public float BanUntil;
+            public float LastAttemptTime;
+        }
+
+        private readonly Dictionary<int, ConnData>    _sessions = new();
+        private readonly Dictionary<string, IpData>   _ipBans   = new();
         private Coroutine _cleanupCoroutine;
 
         private void Awake()
@@ -70,11 +89,30 @@ namespace RPG.Network
 
         public void OnServerConnect(NetworkConnectionToClient conn)
         {
-            var session = new ConnData { SessionNonce = GameManager.GenerateNonce() };
+            string remoteAddress = conn.address ?? "unknown";
+
+            // Verifica se o IP está banido
+            if (IsIpBanned(remoteAddress))
+            {
+                Debug.LogWarning($"[ServerAuth] IP banido tentou conectar: {remoteAddress}");
+                conn.Send(new MsgLoginResponse
+                {
+                    Success = false,
+                    Error   = "Muitas tentativas falhas. Tente novamente em alguns minutos."
+                });
+                conn.Disconnect();
+                return;
+            }
+
+            var session = new ConnData
+            {
+                SessionNonce  = GameManager.GenerateNonce(),
+                RemoteAddress = remoteAddress
+            };
             _sessions[conn.connectionId] = session;
 
             conn.Send(new MsgAuthChallenge { Nonce = session.SessionNonce });
-            LogAuth($"Nova conexão: {conn.connectionId} | nonce enviado.");
+            LogAuth($"Nova conexão: {conn.connectionId} (IP {remoteAddress}) | nonce enviado.");
         }
 
         public void OnServerDisconnect(NetworkConnectionToClient conn)
@@ -100,18 +138,43 @@ namespace RPG.Network
                 return;
             }
 
+            // Throttle entre tentativas (proteção contra brute-force rápido)
+            if (Time.time - session.LastLoginAttemptTime < MIN_TIME_BETWEEN_LOGINS)
+            {
+                conn.Send(new MsgLoginResponse
+                {
+                    Success = false,
+                    Error   = "Aguarde antes de tentar novamente."
+                });
+                return;
+            }
+            session.LastLoginAttemptTime = Time.time;
+
+            // Rate limit por conexão
             session.LoginAttempts++;
-            if (session.LoginAttempts > LOGIN_MAX_ATTEMPTS)
+            if (session.LoginAttempts > LOGIN_MAX_ATTEMPTS_PER_CONN)
             {
                 Debug.LogWarning($"[ServerAuth] SECURITY: conn:{conn.connectionId} excedeu tentativas.");
+                RecordFailedLoginAttempt(session.RemoteAddress);
                 conn.Send(new MsgLoginResponse { Success = false, Error = "Muitas tentativas. Tente mais tarde." });
                 conn.Disconnect();
                 return;
             }
 
+            // Validação básica
             if (string.IsNullOrWhiteSpace(msg.Username) || string.IsNullOrWhiteSpace(msg.SignedHash))
             {
                 conn.Send(new MsgLoginResponse { Success = false, Error = "Dados de login inválidos." });
+                return;
+            }
+
+            // Validação de tamanho — defesa contra abuso
+            if (msg.Username.Length > 64 || msg.SignedHash.Length > 256)
+            {
+                Debug.LogWarning($"[ServerAuth] SECURITY: payload anormal de {session.RemoteAddress}");
+                RecordFailedLoginAttempt(session.RemoteAddress);
+                conn.Send(new MsgLoginResponse { Success = false, Error = "Dados inválidos." });
+                conn.Disconnect();
                 return;
             }
 
@@ -127,7 +190,9 @@ namespace RPG.Network
 
             if (account == null)
             {
-                string attempts = $"({session.LoginAttempts}/{LOGIN_MAX_ATTEMPTS})";
+                RecordFailedLoginAttempt(session.RemoteAddress);
+
+                string attempts = $"({session.LoginAttempts}/{LOGIN_MAX_ATTEMPTS_PER_CONN})";
                 conn.Send(new MsgLoginResponse
                 {
                     Success = false,
@@ -136,16 +201,56 @@ namespace RPG.Network
                 return;
             }
 
+            // Login bem-sucedido
             session.State            = ConnState.Authenticated;
             session.Username         = account.Username;
             session.CachedAccount    = account;
             session.LoginAttempts    = 0;
             session.LastActivityTime = Time.time;
 
+            // Limpa tentativas falhas deste IP (login OK)
+            ClearIpFailures(session.RemoteAddress);
+
             conn.Send(new MsgLoginResponse { Success = true, Username = account.Username });
             SendCharacterList(conn, account);
 
-            Debug.Log($"[ServerAuth] Login OK: {account.Username}");
+            Debug.Log($"[ServerAuth] Login OK: {account.Username} (IP {session.RemoteAddress})");
+        }
+
+        // ── Rate limit por IP ──────────────────────────────────────────────
+
+        private bool IsIpBanned(string ip)
+        {
+            if (string.IsNullOrEmpty(ip) || ip == "unknown") return false;
+            if (!_ipBans.TryGetValue(ip, out var data)) return false;
+            return Time.time < data.BanUntil;
+        }
+
+        private void RecordFailedLoginAttempt(string ip)
+        {
+            if (string.IsNullOrEmpty(ip) || ip == "unknown") return;
+
+            if (!_ipBans.TryGetValue(ip, out var data))
+            {
+                data = new IpData();
+                _ipBans[ip] = data;
+            }
+
+            data.FailedAttempts++;
+            data.LastAttemptTime = Time.time;
+
+            if (data.FailedAttempts >= LOGIN_MAX_ATTEMPTS_PER_IP)
+            {
+                data.BanUntil = Time.time + IP_BAN_DURATION_SECONDS;
+                Debug.LogWarning($"[ServerAuth] SECURITY: IP banido por brute-force: {ip} " +
+                                 $"({data.FailedAttempts} falhas)");
+            }
+        }
+
+        private void ClearIpFailures(string ip)
+        {
+            if (string.IsNullOrEmpty(ip) || ip == "unknown") return;
+            _ipBans.Remove(ip);
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -154,6 +259,21 @@ namespace RPG.Network
 
         private void OnCreateAccountRequest(NetworkConnectionToClient conn, MsgCreateAccountRequest msg)
         {
+            // Rate limit também aqui
+            if (_sessions.TryGetValue(conn.connectionId, out var session))
+            {
+                if (Time.time - session.LastLoginAttemptTime < MIN_TIME_BETWEEN_LOGINS)
+                {
+                    conn.Send(new MsgCreateAccountResponse
+                    {
+                        Success = false,
+                        Error   = "Aguarde antes de tentar novamente."
+                    });
+                    return;
+                }
+                session.LastLoginAttemptTime = Time.time;
+            }
+
             if (string.IsNullOrWhiteSpace(msg.Username))
             {
                 conn.Send(new MsgCreateAccountResponse { Success = false, Error = "Username inválido." });
@@ -165,6 +285,24 @@ namespace RPG.Network
                 return;
             }
 
+            // Validação de tamanho
+            if (msg.Username.Length > 64 || msg.PasswordHash.Length > 256)
+            {
+                conn.Send(new MsgCreateAccountResponse { Success = false, Error = "Dados inválidos." });
+                return;
+            }
+
+            // Validação de caracteres permitidos no username
+            if (!IsValidUsername(msg.Username))
+            {
+                conn.Send(new MsgCreateAccountResponse
+                {
+                    Success = false,
+                    Error   = "Username deve conter apenas letras, números e underscore."
+                });
+                return;
+            }
+
             var error = DatabaseManager.Instance?.TryCreateAccount(msg.Username, msg.PasswordHash);
             if (error != null)
             {
@@ -173,6 +311,18 @@ namespace RPG.Network
             }
             conn.Send(new MsgCreateAccountResponse { Success = true });
             Debug.Log($"[ServerAuth] Conta criada: {msg.Username}");
+        }
+
+        private static bool IsValidUsername(string username)
+        {
+            if (string.IsNullOrWhiteSpace(username)) return false;
+            string trimmed = username.Trim();
+            if (trimmed.Length < 4 || trimmed.Length > 20) return false;
+            foreach (char c in trimmed)
+            {
+                if (!char.IsLetterOrDigit(c) && c != '_') return false;
+            }
+            return true;
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -211,6 +361,28 @@ namespace RPG.Network
             if (!RequireAuth(conn, out var session)) return;
             UpdateActivity(session);
 
+            // Validação do nome
+            if (string.IsNullOrWhiteSpace(msg.Name) || msg.Name.Length > 20)
+            {
+                conn.Send(new MsgCreateCharacterResponse
+                {
+                    Success = false,
+                    Error   = "Nome inválido (2 a 20 caracteres)."
+                });
+                return;
+            }
+
+            // Valida o índice de raça
+            if (msg.RaceIndex < 0 || !System.Enum.IsDefined(typeof(CharacterRace), msg.RaceIndex))
+            {
+                conn.Send(new MsgCreateCharacterResponse
+                {
+                    Success = false,
+                    Error   = "Raça inválida."
+                });
+                return;
+            }
+
             var error = DatabaseManager.Instance?.TryCreateCharacter(
                 session.Username, msg.Name, (CharacterRace)msg.RaceIndex);
 
@@ -243,6 +415,16 @@ namespace RPG.Network
             if (session.State == ConnState.InGame)
             {
                 conn.Send(new MsgSelectCharacterResponse { Success = false, Error = "Já está em jogo." });
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(msg.CharacterId))
+            {
+                conn.Send(new MsgSelectCharacterResponse
+                {
+                    Success = false,
+                    Error   = "ID de personagem inválido."
+                });
                 return;
             }
 
@@ -296,7 +478,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Limpeza de sessões expiradas
+        // Limpeza de sessões expiradas e IPs banidos
         // ══════════════════════════════════════════════════════════════════
 
         /// <summary>
@@ -305,30 +487,45 @@ namespace RPG.Network
         ///   Unauthenticated → limpa por timer
         ///   Authenticated   → limpa por timer (idle, sem entrar no jogo)
         ///   InGame          → NUNCA limpa por timer (apenas via disconnect)
+        ///
+        /// Também limpa IP bans expirados.
         /// </summary>
         private IEnumerator CleanupExpiredSessions()
         {
             var wait = new WaitForSeconds(CLEANUP_INTERVAL);
-            var expired = new List<int>();
+            var expiredSessions = new List<int>();
+            var expiredIps      = new List<string>();
 
             while (true)
             {
                 yield return wait;
 
-                expired.Clear();
+                // Sessões
+                expiredSessions.Clear();
                 foreach (var kv in _sessions)
                 {
                     if (kv.Value.State == ConnState.InGame) continue;
                     if (Time.time - kv.Value.LastActivityTime > SESSION_TTL_SECONDS)
-                        expired.Add(kv.Key);
+                        expiredSessions.Add(kv.Key);
                 }
-
-                foreach (var id in expired)
+                foreach (var id in expiredSessions)
                 {
                     var state = _sessions[id].State;
                     _sessions.Remove(id);
                     Debug.Log($"[ServerAuthManager] Sessão expirada removida: connId={id} estado={state}");
                 }
+
+                // IP bans
+                expiredIps.Clear();
+                foreach (var kv in _ipBans)
+                {
+                    var data = kv.Value;
+                    // Remove se: passou da hora do ban OR última tentativa muito antiga
+                    if (Time.time >= data.BanUntil && Time.time - data.LastAttemptTime > IP_BAN_DURATION_SECONDS)
+                        expiredIps.Add(kv.Key);
+                }
+                foreach (var ip in expiredIps)
+                    _ipBans.Remove(ip);
             }
         }
     }
