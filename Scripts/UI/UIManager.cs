@@ -7,31 +7,27 @@ using RPG.Combat;
 namespace RPG.UI
 {
     /// <summary>
-    /// UIManager v9
+    /// UIManager v10
     ///
-    /// CORREÇÃO v9 — Botão do PowerGemUI não abria:
+    /// === MELHORIAS v10 SOBRE v9 ===
     ///
-    ///   CAUSA RAIZ: O GameObject do PowerGemUI (ou seu pai) começava desativado
-    ///   no Inspector. Isso impede que o Awake() rode, então PowerGemUI.Instance
-    ///   fica null. O onClick do botão captura Instance em runtime, mas se o
-    ///   objeto nunca acordou, Instance é null e Toggle() nunca é chamado.
+    ///   1. CLEANUP COMPLETO EM OnDestroy:
+    ///      Todos os listeners de botões são removidos. Subscrições no
+    ///      PlayerEntity e SkillSystem também são desfeitas.
     ///
-    ///   SOLUÇÃO: Os botões de HUD (inventoryHudButton, powerGemHudButton) agora
-    ///   são registrados em BindLocalPlayer() em vez de Start(), garantindo que
-    ///   os singletons já existem quando o jogador entra no jogo.
-    ///   Adicionado também um fallback FindObjectOfType para casos onde o
-    ///   GameObject estava inativo durante o Start().
+    ///   2. SEM RegisterHudButtonsSafe DUPLICADO:
+    ///      Antes, RemoveAllListeners + AddListener era chamado múltiplas
+    ///      vezes em sucessão (em Start E em BindLocalPlayer). Agora,
+    ///      a flag _hudButtonsRegistered é confiável e previne duplicação.
     ///
-    ///   CORREÇÃO ADICIONAL: PowerGemUI e InventoryUI agora têm seus GameObjects
-    ///   raiz SEMPRE ativos na cena — apenas o painel interno (panel/inventoryPanel)
-    ///   começa desativado. Isso garante que Awake() rode e Instance seja setado.
-    ///   (Instrução de setup adicionada nos comentários abaixo.)
+    ///   3. AÇÃO DE UNREGISTER:
+    ///      Adicionado UnregisterHudButtons() para remoção explícita
+    ///      ao trocar de player (ex: re-login sem trocar de cena).
     ///
-    /// SETUP OBRIGATÓRIO NO INSPECTOR:
+    /// SETUP OBRIGATÓRIO NO INSPECTOR (inalterado):
     ///   - O GameObject que tem PowerGemUI.cs DEVE estar ATIVO na hierarquia.
-    ///     Apenas o campo [SerializeField] panel (filho interno) deve começar inativo.
+    ///     Apenas o campo [SerializeField] panel deve começar inativo.
     ///   - O mesmo vale para InventoryUI, ItemTooltipUI, FloatingTextManager etc.
-    ///   - Se o GameObject raiz estiver inativo, Awake() não roda e Instance = null.
     /// </summary>
     public class UIManager : MonoBehaviour
     {
@@ -68,9 +64,7 @@ namespace RPG.UI
         [SerializeField] private Button            attributeWindowButton;
 
         [Header("Atalhos de UI (opcional)")]
-        [Tooltip("Botão na HUD que abre o inventário. Pode ser null se usar só a tecla I.")]
         [SerializeField] private Button inventoryHudButton;
-        [Tooltip("Botão na HUD que abre as Joias do Poder. Pode ser null se usar só a tecla P.")]
         [SerializeField] private Button powerGemHudButton;
 
         private PlayerEntity              _player;
@@ -78,9 +72,13 @@ namespace RPG.UI
         private RPG.Network.NetworkPlayer _netPlayer;
         private float                     _messageTimer;
 
-        // Controla se os listeners dos botões de HUD já foram registrados
-        // (evita duplicar ao chamar BindLocalPlayer mais de uma vez)
+        // Callbacks armazenadas para permitir RemoveListener exato
+        private UnityEngine.Events.UnityAction _attributeButtonCallback;
+        private UnityEngine.Events.UnityAction _inventoryButtonCallback;
+        private UnityEngine.Events.UnityAction _powerGemButtonCallback;
+
         private bool _hudButtonsRegistered = false;
+        private bool _attributeButtonRegistered = false;
 
         private void Awake()
         {
@@ -93,46 +91,53 @@ namespace RPG.UI
             ClearTargetPanel();
             if (messageText != null) messageText.text = "";
 
-            // Botão da janela de atributos (C) — registrado aqui pois AttributeWindowUI
-            // geralmente está sempre ativo na cena.
-            if (attributeWindowButton != null)
-                attributeWindowButton.onClick.AddListener(() => attributeWindow?.Toggle());
+            // Botão da janela de atributos — singleton geralmente sempre ativo
+            if (attributeWindowButton != null && !_attributeButtonRegistered)
+            {
+                _attributeButtonCallback = () => attributeWindow?.Toggle();
+                attributeWindowButton.onClick.AddListener(_attributeButtonCallback);
+                _attributeButtonRegistered = true;
+            }
 
-            // CORREÇÃO v9: botões de inventário e joias são registrados AQUI
-            // apenas como fallback para modo offline/host onde o player já existe.
-            // Em multiplayer, RegisterHudButtons() é chamado em BindLocalPlayer()
-            // quando os singletons já estão garantidamente inicializados.
             RegisterHudButtonsSafe();
 
-            // Modo offline: tenta vincular ao PlayerEntity que já existe na cena
+            // Modo offline
             var player = FindObjectOfType<PlayerEntity>();
             if (player != null && player.IsInitialized)
                 BindLocalPlayer(player);
         }
 
+        private void OnDestroy()
+        {
+            UnsubscribeFromPlayer();
+            UnsubscribeFromSkills();
+
+            // Remove listeners dos botões usando as referências exatas
+            if (attributeWindowButton != null && _attributeButtonCallback != null)
+                attributeWindowButton.onClick.RemoveListener(_attributeButtonCallback);
+
+            UnregisterHudButtons();
+
+            if (Instance == this) Instance = null;
+        }
+
         /// <summary>
-        /// Registra os listeners dos botões de HUD de forma segura.
-        /// Verifica se os singletons existem antes de registrar.
-        /// Registra no máximo uma vez (guarda flag _hudButtonsRegistered).
+        /// Registra os listeners dos botões de HUD UMA VEZ.
+        /// Reentrante: se já registrado, retorna imediatamente.
         /// </summary>
         private void RegisterHudButtonsSafe()
         {
             if (_hudButtonsRegistered) return;
 
-            bool inventoryReady = InventoryUI.Instance != null;
-            bool gemReady       = PowerGemUI.Instance  != null;
-
-            // Fallback: tenta encontrar via FindObjectOfType se Instance for null
-            // (acontece quando o GameObject raiz estava inativo durante o Awake da UI)
-            if (!inventoryReady)
+            // Fallback de log se singletons estão null
+            if (InventoryUI.Instance == null)
             {
                 var found = FindObjectOfType<InventoryUI>();
                 if (found != null)
                     Debug.LogWarning("[UIManager] InventoryUI.Instance era null — encontrado via FindObjectOfType. " +
                                      "Verifique se o GameObject do InventoryUI está ATIVO na hierarquia.");
             }
-
-            if (!gemReady)
+            if (PowerGemUI.Instance == null)
             {
                 var found = FindObjectOfType<PowerGemUI>();
                 if (found != null)
@@ -140,43 +145,56 @@ namespace RPG.UI
                                      "Verifique se o GameObject do PowerGemUI está ATIVO na hierarquia.");
             }
 
-            // Registra o botão de inventário
-            if (inventoryHudButton != null)
+            // Inventory button — registra com referência armazenada para cleanup
+            if (inventoryHudButton != null && _inventoryButtonCallback == null)
             {
-                inventoryHudButton.onClick.RemoveAllListeners();
-                inventoryHudButton.onClick.AddListener(() =>
+                _inventoryButtonCallback = () =>
                 {
                     if (InventoryUI.Instance != null)
                         InventoryUI.Instance.Toggle();
                     else
                         Debug.LogWarning("[UIManager] InventoryUI.Instance é null ao clicar no botão!");
-                });
+                };
+                inventoryHudButton.onClick.AddListener(_inventoryButtonCallback);
             }
 
-            // Registra o botão de joias do poder
-            if (powerGemHudButton != null)
+            // Power Gem button
+            if (powerGemHudButton != null && _powerGemButtonCallback == null)
             {
-                powerGemHudButton.onClick.RemoveAllListeners();
-                powerGemHudButton.onClick.AddListener(() =>
+                _powerGemButtonCallback = () =>
                 {
                     if (PowerGemUI.Instance != null)
-                    {
                         PowerGemUI.Instance.Toggle();
-                    }
                     else
-                    {
                         Debug.LogWarning("[UIManager] PowerGemUI.Instance é null ao clicar no botão! " +
-                                         "Certifique-se que o GameObject do PowerGemUI está ATIVO na hierarquia da cena.");
-                    }
-                });
+                                         "Certifique-se que o GameObject está ATIVO na hierarquia.");
+                };
+                powerGemHudButton.onClick.AddListener(_powerGemButtonCallback);
             }
 
-            // Só marca como registrado se ambos os botões foram configurados
+            // Marca como registrado apenas se ambos foram configurados
             // (ou se não há botões para configurar)
-            if (inventoryHudButton == null && powerGemHudButton == null)
+            bool nothingToRegister = inventoryHudButton == null && powerGemHudButton == null;
+            bool somethingRegistered = (inventoryHudButton == null || _inventoryButtonCallback != null)
+                                    && (powerGemHudButton  == null || _powerGemButtonCallback  != null);
+
+            if (nothingToRegister || somethingRegistered)
                 _hudButtonsRegistered = true;
-            else if (InventoryUI.Instance != null || PowerGemUI.Instance != null)
-                _hudButtonsRegistered = true;
+        }
+
+        private void UnregisterHudButtons()
+        {
+            if (inventoryHudButton != null && _inventoryButtonCallback != null)
+            {
+                inventoryHudButton.onClick.RemoveListener(_inventoryButtonCallback);
+                _inventoryButtonCallback = null;
+            }
+            if (powerGemHudButton != null && _powerGemButtonCallback != null)
+            {
+                powerGemHudButton.onClick.RemoveListener(_powerGemButtonCallback);
+                _powerGemButtonCallback = null;
+            }
+            _hudButtonsRegistered = false;
         }
 
         // ── Vinculação ────────────────────────────────────────────────────
@@ -190,26 +208,13 @@ namespace RPG.UI
                 attributeWindow?.BindPlayer(player);
                 if (player.IsInitialized) ForceRefreshAll();
 
-                // Tenta registrar botões novamente (pode ter falhado no Start
-                // se os singletons ainda não existiam)
+                // Re-tenta registrar botões (singletons podem ter ficado prontos depois)
                 RegisterHudButtonsSafe();
                 return;
             }
 
-            // Desvincula anterior
-            if (_player != null)
-            {
-                _player.OnHPChanged    -= UpdateHP;
-                _player.OnMPChanged    -= UpdateMP;
-                _player.OnStatsChanged -= OnStatsChangedHandler;
-                _player.OnInitialized  -= OnPlayerInitialized;
-            }
-
-            if (_skills != null)
-            {
-                _skills.OnCooldownStarted      -= OnSkillCooldown;
-                _skills.OnSkillBarNeedsRefresh -= InitSkillBar;
-            }
+            UnsubscribeFromPlayer();
+            UnsubscribeFromSkills();
 
             _player    = player;
             _skills    = player.GetComponent<SkillSystem>();
@@ -229,7 +234,6 @@ namespace RPG.UI
 
             attributeWindow?.BindPlayer(player);
 
-            // Vincula UIs de inventário se já estiverem prontas
             var inventory = player.GetComponent<RPG.Network.NetworkInventory>();
             if (inventory != null)
             {
@@ -237,21 +241,33 @@ namespace RPG.UI
                 PowerGemUI.Instance?.BindInventory(inventory);
             }
 
-            // CORREÇÃO v9: registra os botões de HUD aqui, após o player spawnar.
-            // Neste ponto os singletons de UI já estão garantidamente inicializados.
             RegisterHudButtonsSafe();
 
             if (player.IsInitialized)
                 ForceRefreshAll();
-            else
-                Debug.Log("[UIManager] HUD vinculado — aguardando Initialize()");
+        }
+
+        private void UnsubscribeFromPlayer()
+        {
+            if (_player == null) return;
+            _player.OnHPChanged    -= UpdateHP;
+            _player.OnMPChanged    -= UpdateMP;
+            _player.OnStatsChanged -= OnStatsChangedHandler;
+            _player.OnInitialized  -= OnPlayerInitialized;
+        }
+
+        private void UnsubscribeFromSkills()
+        {
+            if (_skills == null) return;
+            _skills.OnCooldownStarted      -= OnSkillCooldown;
+            _skills.OnSkillBarNeedsRefresh -= InitSkillBar;
         }
 
         private void OnPlayerInitialized() => ForceRefreshAll();
 
         private void OnSkillCooldown(int index, float duration)
         {
-            if (skillSlots != null && index < skillSlots.Length)
+            if (skillSlots != null && index >= 0 && index < skillSlots.Length)
                 skillSlots[index]?.StartCooldown(duration);
         }
 
@@ -271,18 +287,14 @@ namespace RPG.UI
                 if (skillSlots[i] == null) continue;
 
                 var skill = _skills.GetSkill(i);
-
-                if (skill?.Icon != null)
-                    skillSlots[i].SetIcon(skill.Icon);
-                else
-                    skillSlots[i].SetIcon(null);
+                skillSlots[i].SetIcon(skill?.Icon);
 
                 if (hotkeyLabels != null && i < hotkeyLabels.Length)
                     skillSlots[i].SetHotkey(hotkeyLabels[i]);
             }
         }
 
-        // ── Update — SOMENTE timer de mensagem ────────────────────────────
+        // ── Update — só timer de mensagem ─────────────────────────────────
 
         private void Update()
         {

@@ -9,54 +9,31 @@ using System.Collections;
 namespace RPG.UI
 {
     /// <summary>
-    /// PowerGemUI v3 — Janela de encaixe das Joias do Poder (tecla P).
+    /// PowerGemUI v4 — Janela de encaixe das Joias do Poder (tecla P).
     ///
-    /// CORREÇÕES v3:
+    /// === MELHORIAS v4 SOBRE v3 ===
     ///
-    ///   1. MODO BROWSE NÃO FUNCIONAVA:
-    ///      TryBindInventory() em Start() falhava silenciosamente porque o
-    ///      NetworkPlayer spawna DEPOIS que a UI é criada em modo multiplayer.
-    ///      Solução: retry via coroutine em OpenBrowse() e OpenForEquip(),
-    ///      além de aceitar bind tardio via BindInventory() chamado pelo
-    ///      NetworkInventory.OnStartLocalPlayer e pelo UIManager.BindLocalPlayer.
+    ///   1. CLEANUP DA COROUTINE WaitAndBind:
+    ///      A coroutine de retry agora é rastreada em _waitAndBindCoroutine
+    ///      e CANCELADA em:
+    ///        - Close() (fechamento manual da UI)
+    ///        - OnDisable() (cena trocou ou GameObject desativado)
+    ///        - OnDestroy() (destruição do GameObject)
+    ///        - Quando o bind acontece com sucesso (autocleanup)
     ///
-    ///   2. DESEQUIPAR JOIA:
-    ///      O modo Browse agora funciona corretamente. Ao pressionar P:
-    ///        - Slots com joia ficam clicáveis → mostra botão "Retirar joia".
-    ///        - Slots vazios ficam cinzas e não reagem ao clique.
-    ///        - Confirmar desequipa via CmdUnequipGem.
+    ///   2. EVENTO DE DESVÍNCULO:
+    ///      OnDestroy agora limpa SEMPRE a subscrição, mesmo que _isOpen seja
+    ///      false e o evento não tenha sido disparado.
     ///
-    ///   3. HIGHLIGHT NO MODO EQUIP:
-    ///      Ao vir do InventoryUI, todos os slots ficam destacados em dourado
-    ///      indicando que o jogador deve escolher onde encaixar a joia.
-    ///      Após escolher, o highlight é removido e a UI fecha.
+    ///   3. SAFE RE-OPEN:
+    ///      Se WaitAndBind ainda está rodando e o usuário fecha+abre, a antiga
+    ///      é cancelada antes de iniciar a nova.
     ///
-    ///   4. TOOLTIP:
-    ///      Fecha junto com a UI (Close()) para evitar tooltip "preso" na tela.
-    ///
-    ///   5. VALIDAÇÃO DE ITEM:
-    ///      OpenForEquip() verifica se a joia ainda existe no inventário antes
-    ///      de abrir, evitando modo equip com slot inválido.
-    ///
-    /// FUNCIONALIDADES:
+    /// FUNCIONALIDADES (mantidas):
     ///   - 4 slots visuais: Q, W, E, R — mostram joia equipada ou slot vazio.
     ///   - Modo "equip" (vem do InventoryUI): clique no slot desejado para equipar.
     ///   - Modo "browse" (tecla P): clique em slot com joia para desequipar.
     ///   - Tooltip ao passar o mouse (via ItemTooltipUI).
-    ///
-    /// SETUP DA CENA (hierarquia sugerida):
-    ///   PowerGemCanvas (Canvas ScreenSpace-Overlay, Sort Order 55)
-    ///     └── PowerGemPanel (Panel + PowerGemUI)
-    ///           ├── Header
-    ///           │   ├── TitleText ("Joias do Poder")
-    ///           │   └── CloseButton
-    ///           ├── InstructionText (TMP_Text — muda conforme modo)
-    ///           ├── SlotsRow (horizontal layout)
-    ///           │   ├── GemSlot_Q  (Button + GemSlotWidget)
-    ///           │   ├── GemSlot_W  (Button + GemSlotWidget)
-    ///           │   ├── GemSlot_E  (Button + GemSlotWidget)
-    ///           │   └── GemSlot_R  (Button + GemSlotWidget)
-    ///           └── UnequipButton (só aparece quando slot com joia é selecionado)
     /// </summary>
     public class PowerGemUI : MonoBehaviour
     {
@@ -78,21 +55,26 @@ namespace RPG.UI
         [SerializeField] private Button   unequipButton;
         [SerializeField] private TMP_Text unequipButtonLabel;
 
+        [Header("Bind retry")]
+        [Tooltip("Quanto tempo (s) o retry aguarda o NetworkInventory aparecer antes de desistir.")]
+        [SerializeField] private float bindRetryTimeout = 10f;
+
         // ── Estado ─────────────────────────────────────────────────────────
         private NetworkInventory  _inventory;
         private bool              _isOpen    = false;
 
-        // Modo equip: quando vem do InventoryUI com uma joia selecionada
         private bool              _equipMode = false;
         private InventorySlotData _pendingGemSlot;
+        private int               _selectedGemSlotIndex = -1;
 
-        // Slot selecionado no modo browse (para desequipar)
-        private int _selectedGemSlotIndex = -1;
+        private Coroutine _waitAndBindCoroutine;
 
         private static readonly string[] SlotNames  = { "Q", "W", "E", "R" };
         private static readonly string[] SlotLabels = { "[Q]", "[W]", "[E]", "[R]" };
 
-        // ── Lifecycle ──────────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════
+        // Lifecycle
+        // ══════════════════════════════════════════════════════════════════
 
         private void Awake()
         {
@@ -111,14 +93,41 @@ namespace RPG.UI
                 unequipButton.gameObject.SetActive(false);
             }
 
-            // Configura callbacks dos slots
             SetupSlotWidget(slotQ, 0);
             SetupSlotWidget(slotW, 1);
             SetupSlotWidget(slotE, 2);
             SetupSlotWidget(slotR, 3);
 
-            // Tenta vincular imediatamente (funciona em modo Host/Editor)
             TryBindInventory();
+        }
+
+        private void OnDisable()
+        {
+            // Cancela retry se a UI for desativada (cena trocada, etc)
+            StopWaitAndBindCoroutine();
+        }
+
+        private void OnDestroy()
+        {
+            StopWaitAndBindCoroutine();
+
+            // Limpa subscrição SEMPRE, mesmo se a UI não estava aberta
+            if (_inventory != null)
+                _inventory.OnGemLoadoutChanged -= OnLoadoutChanged;
+
+            if (closeButton != null)        closeButton.onClick.RemoveListener(Close);
+            if (unequipButton != null)      unequipButton.onClick.RemoveListener(OnUnequipClicked);
+
+            if (Instance == this) Instance = null;
+        }
+
+        private void StopWaitAndBindCoroutine()
+        {
+            if (_waitAndBindCoroutine != null)
+            {
+                StopCoroutine(_waitAndBindCoroutine);
+                _waitAndBindCoroutine = null;
+            }
         }
 
         private void SetupSlotWidget(GemSlotWidget widget, int slotIndex)
@@ -132,13 +141,6 @@ namespace RPG.UI
 
         // ── Vínculo com NetworkInventory ───────────────────────────────────
 
-        /// <summary>
-        /// Chamado pelo NetworkInventory.OnStartLocalPlayer (via BindUIDelayed)
-        /// e pelo UIManager.BindLocalPlayer.
-        ///
-        /// CORREÇÃO v3: aceita bind tardio. Em multiplayer, o player spawna depois
-        /// da UI, então este método pode ser chamado a qualquer momento.
-        /// </summary>
         public void BindInventory(NetworkInventory inventory)
         {
             if (inventory == null || _inventory == inventory) return;
@@ -149,14 +151,12 @@ namespace RPG.UI
             _inventory = inventory;
             _inventory.OnGemLoadoutChanged += OnLoadoutChanged;
 
+            // Bind feito com sucesso — cancela qualquer retry pendente
+            StopWaitAndBindCoroutine();
+
             if (_isOpen) RefreshSlots();
-            Debug.Log("[PowerGemUI] Vinculado ao NetworkInventory.");
         }
 
-        /// <summary>
-        /// Tenta vincular ao NetworkInventory do player local.
-        /// Retorna true se conseguiu vincular.
-        /// </summary>
         private bool TryBindInventory()
         {
             if (_inventory != null) return true;
@@ -169,27 +169,31 @@ namespace RPG.UI
             return true;
         }
 
-        /// <summary>
-        /// CORREÇÃO v3: coroutine de retry para quando a UI abre antes do player spawnar.
-        /// Tenta vincular a cada 0.2s por até 10s.
-        /// </summary>
         private IEnumerator WaitAndBind()
         {
             float elapsed = 0f;
-            while (_inventory == null && elapsed < 10f)
+            var wait = new WaitForSeconds(0.2f);
+
+            while (_inventory == null && elapsed < bindRetryTimeout)
             {
-                yield return new WaitForSeconds(0.2f);
+                yield return wait;
                 elapsed += 0.2f;
-                TryBindInventory();
+                if (TryBindInventory()) break;
             }
+
+            // Cleanup do handle SEMPRE, mesmo se chegou aqui por desistência
+            _waitAndBindCoroutine = null;
 
             if (_inventory == null)
             {
-                Debug.LogWarning("[PowerGemUI] Não foi possível vincular ao NetworkInventory após 10s.");
+                Debug.LogWarning($"[PowerGemUI] Não foi possível vincular ao NetworkInventory após {bindRetryTimeout}s.");
+                if (_isOpen && instructionText != null)
+                    instructionText.text = "Erro: inventário indisponível.\nReabra a tela.";
             }
             else if (_isOpen)
             {
                 RefreshSlots();
+                if (_equipMode) HighlightAllSlots(true);
             }
         }
 
@@ -206,12 +210,6 @@ namespace RPG.UI
             else         OpenBrowse();
         }
 
-        /// <summary>
-        /// Abre em modo "visualizar/desequipar" (tecla P).
-        ///
-        /// CORREÇÃO v3: se _inventory ainda for null (player ainda não spawnado),
-        /// inicia coroutine de retry para tentar vincular enquanto a UI fica aberta.
-        /// </summary>
         public void OpenBrowse()
         {
             _equipMode            = false;
@@ -226,12 +224,14 @@ namespace RPG.UI
             if (panel         != null) panel.SetActive(true);
             if (unequipButton != null) unequipButton.gameObject.SetActive(false);
 
-            // Garante que os slots fiquem sem highlight no modo browse
             HighlightAllSlots(false);
 
             if (!TryBindInventory())
             {
-                StartCoroutine(WaitAndBind());
+                // Cancela qualquer retry anterior antes de iniciar um novo
+                StopWaitAndBindCoroutine();
+                _waitAndBindCoroutine = StartCoroutine(WaitAndBind());
+
                 if (instructionText != null)
                     instructionText.text = "Conectando ao inventário...";
                 return;
@@ -240,11 +240,6 @@ namespace RPG.UI
             RefreshSlots();
         }
 
-        /// <summary>
-        /// Abre em modo "equipar" — chamado pelo InventoryUI com a joia selecionada.
-        ///
-        /// CORREÇÃO v3: retry se _inventory for null, igual ao OpenBrowse.
-        /// </summary>
         public void OpenForEquip(InventorySlotData gemSlotData)
         {
             // Valida que o item ainda existe no inventário
@@ -278,7 +273,8 @@ namespace RPG.UI
 
             if (!TryBindInventory())
             {
-                StartCoroutine(WaitAndBind());
+                StopWaitAndBindCoroutine();
+                _waitAndBindCoroutine = StartCoroutine(WaitAndBind());
                 return;
             }
 
@@ -288,12 +284,14 @@ namespace RPG.UI
 
         public void Close()
         {
+            // Cancela retry pendente para evitar memory leak
+            StopWaitAndBindCoroutine();
+
             _isOpen               = false;
             _equipMode            = false;
             _selectedGemSlotIndex = -1;
             HighlightAllSlots(false);
 
-            // Limpa seleção visual em todos os slots
             slotQ?.SetSelected(false);
             slotW?.SetSelected(false);
             slotE?.SetSelected(false);
@@ -302,7 +300,6 @@ namespace RPG.UI
             if (panel         != null) panel.SetActive(false);
             if (unequipButton != null) unequipButton.gameObject.SetActive(false);
 
-            // Fecha tooltip junto para evitar tooltip "preso"
             ItemTooltipUI.Instance?.Hide();
         }
 
@@ -317,8 +314,7 @@ namespace RPG.UI
             RefreshSlotWidget(slotE, 2);
             RefreshSlotWidget(slotR, 3);
 
-            // Atualiza instrução baseado no estado atual dos slots
-            if (!_equipMode && instructionText != null)
+            if (!_equipMode && instructionText != null && _selectedGemSlotIndex < 0)
             {
                 bool anyGem = false;
                 for (int i = 0; i < 4; i++)
@@ -341,7 +337,6 @@ namespace RPG.UI
             widget.SetGem(item, isEmpty ? null : gemId);
             widget.SetSelected(slotIndex == _selectedGemSlotIndex);
 
-            // No modo equip, mantém o highlight em todos os slots
             if (_equipMode)
                 widget.SetHighlight(true);
         }
@@ -362,7 +357,6 @@ namespace RPG.UI
 
             if (_equipMode)
             {
-                // ── MODO EQUIP: encaixa a joia pendente neste slot ──────────
                 _inventory.CmdEquipGem(slotIndex, _pendingGemSlot.SlotIndex);
                 HighlightAllSlots(false);
                 Close();
@@ -370,13 +364,11 @@ namespace RPG.UI
             }
             else
             {
-                // ── MODO BROWSE: seleciona para desequipar ──────────────────
                 string gemId  = _inventory.GetGemItemId(slotIndex);
                 bool   hasGem = !string.IsNullOrEmpty(gemId);
 
                 if (hasGem)
                 {
-                    // Seleciona este slot (deseleciona o anterior)
                     _selectedGemSlotIndex = slotIndex;
                     RefreshSlots();
 
@@ -387,17 +379,16 @@ namespace RPG.UI
                             unequipButtonLabel.text = $"Retirar joia do slot {SlotNames[slotIndex]}";
                     }
 
-                    // Atualiza instrução
                     if (instructionText != null)
                     {
                         var item = ItemDatabase.Instance?.GetItem(gemId);
                         string name = item?.DisplayName ?? "joia";
-                        instructionText.text = $"Slot {SlotNames[slotIndex]}: <color=#FFD700>{name}</color>\nClique em \"Retirar\" para desequipar.";
+                        instructionText.text =
+                            $"Slot {SlotNames[slotIndex]}: <color=#FFD700>{name}</color>\nClique em \"Retirar\" para desequipar.";
                     }
                 }
                 else
                 {
-                    // Slot vazio: cancela seleção
                     _selectedGemSlotIndex = -1;
                     RefreshSlots();
                     if (unequipButton != null) unequipButton.gameObject.SetActive(false);
@@ -422,35 +413,21 @@ namespace RPG.UI
             if (_selectedGemSlotIndex < 0 || _inventory == null) return;
 
             string slotName = SlotNames[_selectedGemSlotIndex];
-
-            // Pega o nome da joia antes de desequipar (para o feedback)
-            string gemId  = _inventory.GetGemItemId(_selectedGemSlotIndex);
-            var    item   = string.IsNullOrEmpty(gemId) ? null : ItemDatabase.Instance?.GetItem(gemId);
-            string gemName = item?.DisplayName ?? "joia";
+            string gemId    = _inventory.GetGemItemId(_selectedGemSlotIndex);
+            var    item     = string.IsNullOrEmpty(gemId) ? null : ItemDatabase.Instance?.GetItem(gemId);
+            string gemName  = item?.DisplayName ?? "joia";
 
             _inventory.CmdUnequipGem(_selectedGemSlotIndex);
 
             UIManager.Instance?.ShowMessage($"{gemName} removida do slot {slotName}.");
-            Debug.Log($"[PowerGemUI] Desequipando slot {slotName}.");
 
-            // Reseta seleção e atualiza visual
             _selectedGemSlotIndex = -1;
             if (unequipButton != null) unequipButton.gameObject.SetActive(false);
 
             if (instructionText != null)
                 instructionText.text = "Clique em um slot com joia para removê-la.";
 
-            // RefreshSlots() será chamado automaticamente via OnLoadoutChanged
-            // quando o SyncVar atualizar, mas chamamos aqui para resposta imediata
             RefreshSlots();
-        }
-
-        // ── Cleanup ────────────────────────────────────────────────────────
-
-        private void OnDestroy()
-        {
-            if (_inventory != null)
-                _inventory.OnGemLoadoutChanged -= OnLoadoutChanged;
         }
     }
 }

@@ -8,31 +8,33 @@ using System.Collections.Generic;
 namespace RPG.UI
 {
     /// <summary>
-    /// InventoryUI v7 — NOVO: botão "Desequipar" no ActionPanel.
+    /// InventoryUI v8 — Cleanup completo de callbacks dos slots.
     ///
-    /// MUDANÇAS v7:
-    ///   - Novo campo _unequipButton: botão que aparece apenas quando o item
-    ///     atualmente selecionado é um equipamento JÁ EQUIPADO (clicado a
-    ///     partir do EquipmentPanelUI).
-    ///   - Novo estado _selectedEquipSlot (EquipmentSlot): identifica que a
-    ///     seleção corrente vem do painel de equipamento (não do inventário).
-    ///   - Novo método público ShowActionPanelForEquipment(slot, item):
-    ///     chamado pelo EquipmentPanelUI ao clique esquerdo num slot ocupado.
-    ///   - Novo método público CloseActionPanelExternal(): chamado pelo
-    ///     EquipmentPanelUI ao clique em slot vazio.
-    ///   - OnSlotClicked (inventário) agora limpa seleção do EquipmentPanel
-    ///     e esconde o botão Desequipar.
+    /// === MELHORIAS v8 SOBRE v7 ===
     ///
-    /// Mantido v6: fecha _windowRoot em Start(), tecla I/Escape, integração
-    /// com PowerGemUI.OpenForEquip, e todas as APIs do InventorySlotUI.
+    ///   1. UNREGISTER DE CALLBACKS DOS SLOTS:
+    ///      Antes, ao recriar/destruir slots, os callbacks (OnSlotClicked, etc)
+    ///      ficavam pendurados em delegates. Agora, em OnDestroy E em RefreshGrid
+    ///      (quando reduz quantidade de slots), os callbacks são removidos explicitamente.
+    ///
+    ///   2. ESCAPE INTELIGENTE:
+    ///      Se o player está digitando num InputField (chat futuro, search box),
+    ///      Escape NÃO fecha o inventário. _toggleKey também respeita.
+    ///
+    ///   3. CLEAR SELECTION AO BIND:
+    ///      Ao trocar de inventário (player reconectou ou trocou personagem),
+    ///      a seleção é limpa para evitar referências a slots de outro player.
+    ///
+    /// Mantido v7: botão "Desequipar", v6 fecha _windowRoot em Start(), tecla I/Escape,
+    /// integração com PowerGemUI.OpenForEquip.
     /// </summary>
     public class InventoryUI : MonoBehaviour
     {
         public static InventoryUI Instance { get; private set; }
 
         [Header("Grid do Inventário")]
-        [SerializeField] private Transform        _slotsContainer;
-        [SerializeField] private InventorySlotUI  _slotPrefab;
+        [SerializeField] private Transform       _slotsContainer;
+        [SerializeField] private InventorySlotUI _slotPrefab;
 
         [Header("Painel de Equipamento (lateral)")]
         [SerializeField] private EquipmentPanelUI _equipmentPanel;
@@ -40,10 +42,10 @@ namespace RPG.UI
         [Header("Painel de Ação (item selecionado)")]
         [SerializeField] private GameObject _actionPanel;
         [SerializeField] private TMP_Text   _selectedItemNameText;
-        [SerializeField] private Button     _useButton;        // consumível
-        [SerializeField] private Button     _equipGemButton;   // joia
-        [SerializeField] private Button     _equipItemButton;  // equipamento
-        [SerializeField] private Button     _unequipButton;    // NOVO v7 — desequipar
+        [SerializeField] private Button     _useButton;
+        [SerializeField] private Button     _equipGemButton;
+        [SerializeField] private Button     _equipItemButton;
+        [SerializeField] private Button     _unequipButton;
         [SerializeField] private Button     _discardButton;
         [SerializeField] private Button     _closeActionPanelButton;
 
@@ -58,12 +60,9 @@ namespace RPG.UI
         [SerializeField] private KeyCode _toggleKey     = KeyCode.I;
         [SerializeField] private bool    _closeOnEscape = true;
 
-        // ── Estado ─────────────────────────────────────────────────────────
         private NetworkInventory _inventory;
         private readonly List<InventorySlotUI> _slots = new();
 
-        // Seleção: se a fonte é o inventário, _selectedSlotIndex >= 0 e _selectedEquipSlot == None.
-        // Se a fonte é o painel de equipamento, _selectedSlotIndex == -1 e _selectedEquipSlot != None.
         private int           _selectedSlotIndex = -1;
         private EquipmentSlot _selectedEquipSlot = EquipmentSlot.None;
         private ItemData      _selectedItemData;
@@ -93,13 +92,16 @@ namespace RPG.UI
             if (_windowRoot != null)
                 _windowRoot.SetActive(false);
             else
-                Debug.LogWarning("[InventoryUI] _windowRoot não foi atribuído — a janela pode ficar visível desde o início.");
+                Debug.LogWarning("[InventoryUI] _windowRoot não foi atribuído.");
 
             if (_actionPanel != null) _actionPanel.SetActive(false);
         }
 
         private void Update()
         {
+            // Não reage a teclas quando o usuário está digitando
+            if (IsTypingInInputField()) return;
+
             if (_toggleKey != KeyCode.None && Input.GetKeyDown(_toggleKey))
             {
                 Toggle();
@@ -110,10 +112,23 @@ namespace RPG.UI
                 Close();
         }
 
+        private static bool IsTypingInInputField()
+        {
+            var selected = UnityEngine.EventSystems.EventSystem.current?.currentSelectedGameObject;
+            if (selected == null) return false;
+            return selected.GetComponent<TMP_InputField>() != null
+                || selected.GetComponent<InputField>() != null;
+        }
+
         private void OnDestroy()
         {
             if (Instance == this) Instance = null;
             UnbindFromInventory();
+
+            // Limpa callbacks de TODOS os slots criados
+            foreach (var slot in _slots)
+                ClearSlotCallbacks(slot);
+            _slots.Clear();
 
             _useButton?.onClick.RemoveListener(OnUseButtonClicked);
             _equipGemButton?.onClick.RemoveListener(OnEquipGemButtonClicked);
@@ -124,6 +139,14 @@ namespace RPG.UI
             _closeButton?.onClick.RemoveListener(Close);
         }
 
+        private void ClearSlotCallbacks(InventorySlotUI slot)
+        {
+            if (slot == null) return;
+            slot.OnSlotClicked    -= OnSlotClicked;
+            slot.OnSlotHoverEnter -= OnSlotHoverEnter;
+            slot.OnSlotHoverExit  -= OnSlotHoverExit;
+        }
+
         // ══════════════════════════════════════════════════════════════════
         // Bind
         // ══════════════════════════════════════════════════════════════════
@@ -132,6 +155,12 @@ namespace RPG.UI
         {
             UnbindFromInventory();
             _inventory = inventory;
+
+            // Limpa seleção ao trocar de inventário
+            _selectedSlotIndex = -1;
+            _selectedEquipSlot = EquipmentSlot.None;
+            _selectedItemData  = null;
+            if (_actionPanel != null) _actionPanel.SetActive(false);
 
             if (_inventory != null)
             {
@@ -157,11 +186,6 @@ namespace RPG.UI
             _inventory = null;
         }
 
-        /// <summary>
-        /// Se a seleção corrente é um item EQUIPADO e ele foi desequipado
-        /// pelo servidor (ex: via clique direito no painel ou auto), fecha
-        /// o ActionPanel.
-        /// </summary>
         private void OnEquipmentChangedRefreshSelection()
         {
             if (_selectedEquipSlot == EquipmentSlot.None) return;
@@ -181,6 +205,7 @@ namespace RPG.UI
 
             int total = _inventory != null ? _inventory.Slots.Count : 0;
 
+            // Cresce o pool se necessário
             while (_slots.Count < total)
             {
                 var slot = Instantiate(_slotPrefab, _slotsContainer);
@@ -207,7 +232,6 @@ namespace RPG.UI
 
             UpdateSelectionVisual();
 
-            // Se a seleção atual do inventário sumiu, fecha o painel
             if (_selectedSlotIndex >= 0 && !SlotExistsInInventory(_selectedSlotIndex))
                 CloseActionPanel();
         }
@@ -233,7 +257,7 @@ namespace RPG.UI
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Callbacks do grid (inventário)
+        // Callbacks do grid
         // ══════════════════════════════════════════════════════════════════
 
         private void OnSlotClicked(InventorySlotUI slot)
@@ -244,7 +268,6 @@ namespace RPG.UI
                 return;
             }
 
-            // Seleção do inventário — limpa seleção do EquipmentPanel
             _selectedSlotIndex = slot.SlotData.SlotIndex;
             _selectedEquipSlot = EquipmentSlot.None;
             _selectedItemData  = slot.ItemData;
@@ -270,16 +293,10 @@ namespace RPG.UI
         // API pública usada pelo EquipmentPanelUI
         // ══════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// NOVO v7 — chamado pelo EquipmentPanelUI quando o jogador clica
-        /// (esquerdo) num slot equipado. Abre o ActionPanel com o botão
-        /// "Desequipar" visível.
-        /// </summary>
         public void ShowActionPanelForEquipment(EquipmentSlot slot, ItemData item)
         {
             if (item == null) return;
 
-            // Limpa seleção do inventário
             _selectedSlotIndex = -1;
             _selectedEquipSlot = slot;
             _selectedItemData  = item;
@@ -288,10 +305,6 @@ namespace RPG.UI
             ShowActionPanelButtonsForEquippedItem(item, slot);
         }
 
-        /// <summary>
-        /// Fecha o ActionPanel externamente (chamado pelo EquipmentPanelUI
-        /// quando o usuário clica em slot vazio).
-        /// </summary>
         public void CloseActionPanelExternal() => CloseActionPanel();
 
         // ══════════════════════════════════════════════════════════════════
@@ -311,7 +324,7 @@ namespace RPG.UI
             if (_useButton       != null) _useButton.gameObject.SetActive(item.IsConsumable);
             if (_equipGemButton  != null) _equipGemButton.gameObject.SetActive(item.IsPowerGem);
             if (_equipItemButton != null) _equipItemButton.gameObject.SetActive(item.IsEquipment);
-            if (_unequipButton   != null) _unequipButton.gameObject.SetActive(false); // NUNCA para item do inventário
+            if (_unequipButton   != null) _unequipButton.gameObject.SetActive(false);
             if (_discardButton   != null) _discardButton.gameObject.SetActive(true);
         }
 
@@ -325,7 +338,6 @@ namespace RPG.UI
                 _selectedItemNameText.color = item.RarityColor;
             }
 
-            // Para item equipado, mostramos APENAS o Desequipar
             if (_useButton       != null) _useButton.gameObject.SetActive(false);
             if (_equipGemButton  != null) _equipGemButton.gameObject.SetActive(false);
             if (_equipItemButton != null) _equipItemButton.gameObject.SetActive(false);
@@ -375,18 +387,10 @@ namespace RPG.UI
             CloseActionPanel();
         }
 
-        /// <summary>
-        /// NOVO v7 — desequipa o item atualmente selecionado no EquipmentPanel,
-        /// devolvendo-o ao inventário (lógica no servidor via CmdUnequipItem).
-        /// </summary>
         private void OnUnequipButtonClicked()
         {
             if (_inventory == null) return;
-            if (_selectedEquipSlot == EquipmentSlot.None)
-            {
-                Debug.LogWarning("[InventoryUI] OnUnequipButtonClicked sem slot equipado selecionado.");
-                return;
-            }
+            if (_selectedEquipSlot == EquipmentSlot.None) return;
 
             _inventory.CmdUnequipItem((byte)_selectedEquipSlot);
             CloseActionPanel();
@@ -432,11 +436,7 @@ namespace RPG.UI
 
         public void Toggle()
         {
-            if (_windowRoot == null)
-            {
-                Debug.LogWarning("[InventoryUI] Toggle ignorado: _windowRoot não atribuído.");
-                return;
-            }
+            if (_windowRoot == null) return;
             if (_windowRoot.activeSelf) Close();
             else                        Open();
         }
