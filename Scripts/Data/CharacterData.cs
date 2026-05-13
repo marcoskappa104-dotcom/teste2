@@ -8,6 +8,18 @@ namespace RPG.Data
     /// Dados persistentes de um personagem.
     /// Toda mudança que afeta stats derivados deve passar pelos setters/métodos
     /// públicos — campos públicos existem apenas por compatibilidade com serialização.
+    ///
+    /// === MELHORIAS DESTA VERSÃO ===
+    ///
+    ///   1. CACHE OPCIONAL DE DerivedStats:
+    ///      GetDerivedStats() agora aceita um parâmetro 'useCache' que, quando true,
+    ///      retorna a versão cacheada se nenhuma mudança ocorreu desde o último cálculo.
+    ///      Use cache em hot paths (validação de equip a cada hover).
+    ///      NÃO use em fluxos onde stats podem mudar entre chamadas (regen loop, etc).
+    ///
+    ///   2. CACHE INVALIDATION EXPLÍCITO:
+    ///      InvalidateStatsCache() força recálculo na próxima chamada.
+    ///      Chame após Level++, AllocatedX++, ou EquipmentBonuses change.
     /// </summary>
     [Serializable]
     public class CharacterData
@@ -30,7 +42,12 @@ namespace RPG.Data
         public int Level
         {
             get => _level;
-            set => _level = Math.Max(1, Math.Min(value, MAX_LEVEL));
+            set
+            {
+                int clamped = Math.Max(1, Math.Min(value, MAX_LEVEL));
+                if (clamped != _level) _statsCacheDirty = true;
+                _level = clamped;
+            }
         }
 
         public long Experience            = 0;
@@ -50,9 +67,29 @@ namespace RPG.Data
         public int AllocatedSTR, AllocatedAGI, AllocatedVIT;
         public int AllocatedDEX, AllocatedINT, AllocatedLUK;
 
-        public DerivedStats GetDerivedStats(BuffBonuses buff = null)
+        // ── Cache de DerivedStats (opt-in via useCache=true) ───────────────
+        [NonSerialized] private DerivedStats _cachedStats;
+        [NonSerialized] private bool         _statsCacheDirty = true;
+
+        /// <summary>
+        /// Marca o cache como sujo. Chame após qualquer mutação que afete stats.
+        /// </summary>
+        public void InvalidateStatsCache() => _statsCacheDirty = true;
+
+        /// <summary>
+        /// Retorna stats derivados. Se useCache=true e nada mudou desde o último
+        /// cálculo, retorna a versão cacheada (zero alocação).
+        ///
+        /// IMPORTANTE: O cache não considera 'buff' como parte do estado;
+        /// se você passar um buff, o cache é IGNORADO.
+        /// </summary>
+        public DerivedStats GetDerivedStats(BuffBonuses buff = null, bool useCache = false)
         {
-            return StatsCalculator.Calculate(
+            // Cache só vale quando não há buff envolvido
+            if (useCache && buff == null && !_statsCacheDirty && _cachedStats != null)
+                return _cachedStats;
+
+            var stats = StatsCalculator.Calculate(
                 BaseAttributes,
                 Level,
                 Race,
@@ -60,12 +97,16 @@ namespace RPG.Data
                 AllocatedDEX, AllocatedINT, AllocatedLUK,
                 EquipmentBonuses,
                 buff);
+
+            if (buff == null)
+            {
+                _cachedStats     = stats;
+                _statsCacheDirty = false;
+            }
+
+            return stats;
         }
 
-        /// <summary>
-        /// Retorna o total de XP necessário para subir do nível atual.
-        /// Static para permitir cálculos sem instanciar.
-        /// </summary>
         public static long GetExperienceForLevel(int level)
         {
             int clamped = Math.Max(1, Math.Min(level, MAX_LEVEL));
@@ -75,11 +116,6 @@ namespace RPG.Data
         /// <summary>
         /// Adiciona experiência e processa level-ups em cascata.
         /// Retorna true se houve ao menos um level up.
-        ///
-        /// Comportamento no nível máximo:
-        ///   - XP atual é mantido para mostrar na UI ("99 — XP excedente perdido")
-        ///   - ExpToNext fica em 0
-        ///   - Tentativas subsequentes de adicionar XP são silenciosamente ignoradas
         /// </summary>
         public bool AddExperience(long amount)
         {
@@ -102,21 +138,16 @@ namespace RPG.Data
                 leveled = true;
             }
 
-            // No nível máximo, descarta XP excedente sem zerar o histórico
-            // (anteriormente zerava Experience, perdendo informação útil para UI).
             if (Level >= MAX_LEVEL)
             {
                 ExperienceToNextLevel = 0;
                 if (Experience < 0) Experience = 0;
             }
 
+            if (leveled) _statsCacheDirty = true;
             return leveled;
         }
 
-        /// <summary>
-        /// Cria uma cópia completa e independente. Útil para snapshots
-        /// e para evitar mutação acidental ao passar referências.
-        /// </summary>
         public CharacterData Clone()
         {
             return new CharacterData
@@ -124,7 +155,7 @@ namespace RPG.Data
                 CharacterId           = CharacterId,
                 CharacterName         = CharacterName,
                 Race                  = Race,
-                Level                 = Level,
+                _level                = _level, // bypass setter to preserve cache state
                 Experience            = Experience,
                 ExperienceToNextLevel = ExperienceToNextLevel,
                 PosX = PosX, PosY = PosY, PosZ = PosZ,
@@ -135,6 +166,7 @@ namespace RPG.Data
                 AllocatedSTR = AllocatedSTR, AllocatedAGI = AllocatedAGI,
                 AllocatedVIT = AllocatedVIT, AllocatedDEX = AllocatedDEX,
                 AllocatedINT = AllocatedINT, AllocatedLUK = AllocatedLUK,
+                _statsCacheDirty      = true, // Clone começa com cache sujo
                 BaseAttributes = new BaseAttributes
                 {
                     STR = BaseAttributes.STR, AGI = BaseAttributes.AGI,
@@ -166,7 +198,6 @@ namespace RPG.Data
 
     /// <summary>
     /// Container leve usado apenas em mensagens de rede.
-    /// Personagens são carregados separadamente pelo DatabaseManager.
     /// </summary>
     [Serializable]
     public class AccountData
