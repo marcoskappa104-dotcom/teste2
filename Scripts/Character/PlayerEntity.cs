@@ -8,20 +8,26 @@ namespace RPG.Character
 {
     /// <summary>
     /// Representação local (cliente) do estado do jogador.
-    /// Recebe atualizações do servidor via NetworkPlayer e expõe eventos para a UI.
     ///
-    /// Princípios:
-    ///   - Stats é uma referência imutável após criada. Mudanças geram um novo
-    ///     objeto via Clone() — outros leitores nunca veem estado intermediário.
-    ///   - Eventos disparam APÓS o estado ser totalmente consistente.
-    ///   - Não há lógica de gameplay aqui — apenas estado e eventos.
+    /// === MUDANÇAS DESTA VERSÃO (lag/movimento) ===
+    ///
+    ///   1. ConfigureAgent agora aplica configurações profissionais:
+    ///      - autoBraking = false (evita desaceleração brusca no fim do path)
+    ///      - acceleration alta (60) — arrancada responsiva
+    ///      - angularSpeed alta (720) — gira rápido sem stutter
+    ///      - stoppingDistance baixa (0.15)
+    ///
+    ///   2. StopMovement: ResetPath() apenas, sem velocity = 0.
+    ///
+    ///   3. MoveToConfirmed: NÃO zera velocity. Apenas SetDestination,
+    ///      o que substitui o path corrente fluidamente.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class PlayerEntity : MonoBehaviour
     {
         public static readonly HashSet<PlayerEntity> All = new HashSet<PlayerEntity>();
 
-        // ── Estado autoritativo (replicado do servidor) ────────────────────
+        // ── Estado autoritativo ────────────────────────────────────────────
         public CharacterData Data  { get; private set; }
         public DerivedStats  Stats { get; private set; }
 
@@ -91,10 +97,6 @@ namespace RPG.Character
 
         // ── Atualizações vindas do servidor ────────────────────────────────
 
-        /// <summary>
-        /// Atualiza HP atual e máximo de forma atômica.
-        /// Se MaxHP mudou, clona Stats antes de modificar (substituição de referência).
-        /// </summary>
         public void SetHPFromServer(float hp, float maxHp)
         {
             if (!IsInitialized) return;
@@ -135,10 +137,6 @@ namespace RPG.Character
             OnMPChanged?.Invoke(CurrentMP, maxMp);
         }
 
-        /// <summary>
-        /// Atualiza apenas MaxHP/MaxMP em uma substituição atômica.
-        /// Outros leitores nunca veem estado parcialmente atualizado.
-        /// </summary>
         public void RefreshStatsFromServer(float maxHp, float maxMp)
         {
             if (!IsInitialized) return;
@@ -156,10 +154,6 @@ namespace RPG.Character
             OnMPChanged?.Invoke(CurrentMP, maxMp);
         }
 
-        /// <summary>
-        /// Recalcula TODOS os DerivedStats a partir do Data atual.
-        /// Usado quando o servidor confirma mudança de atributos ou equipamento.
-        /// </summary>
         public void FullRefreshStatsFromData()
         {
             if (!IsInitialized || Data == null) return;
@@ -226,8 +220,12 @@ namespace RPG.Character
             OnMPChanged?.Invoke(CurrentMP, maxMp);
         }
 
-        // ── Movimento (apenas predição local) ──────────────────────────────
+        // ── Movimento ──────────────────────────────────────────────────────
 
+        /// <summary>
+        /// FIX: SetDestination puro, sem ResetPath, sem velocity = 0.
+        /// O agent substitui o path em curso sem parar.
+        /// </summary>
         public void MoveToConfirmed(Vector3 destination)
         {
             if (IsDead || _agent == null || !_agent.isOnNavMesh) return;
@@ -238,6 +236,10 @@ namespace RPG.Character
                 _agent.SetDestination(destination);
         }
 
+        /// <summary>
+        /// Para o movimento de forma suave: limpa o path.
+        /// FIX: NÃO zera velocity. O brake natural lida com desaceleração.
+        /// </summary>
         public void StopMovement()
         {
             if (_agent != null && _agent.isOnNavMesh)
@@ -269,11 +271,26 @@ namespace RPG.Character
 
         // ── Helpers ───────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Configuração profissional do NavMeshAgent para movimento fluido.
+        ///
+        /// Princípios:
+        ///   - autoBraking OFF: o agent não desacelera ao se aproximar do destino.
+        ///     Isso elimina o efeito "patinada" no fim do path. Quando precisamos
+        ///     parar de fato, é o sistema de combate (BasicAttack/SkillSystem)
+        ///     que faz isso via ResetPath, e o brake natural funciona.
+        ///   - acceleration alta: arranca rápido, sem efeito de "puxar com elástico".
+        ///   - angularSpeed alta: gira rápido sem o personagem "andar de lado".
+        /// </summary>
         private void ConfigureAgent()
         {
             if (_agent == null || Stats == null) return;
+
             _agent.speed            = Mathf.Clamp(Stats.MoveSpeed, 2f, 10f);
-            _agent.stoppingDistance = 0.5f;
+            _agent.acceleration     = 60f;
+            _agent.angularSpeed     = 720f;
+            _agent.autoBraking      = false;
+            _agent.stoppingDistance = 0.15f;
         }
     }
 }

@@ -13,9 +13,6 @@ namespace RPG.Combat
     public enum SkillType   { Physical, Magical, Heal, Buff }
     public enum SkillTarget { Enemy, Self, Ally }
 
-    /// <summary>
-    /// Definição de uma skill. Embedada em ItemData de PowerGem.
-    /// </summary>
     [Serializable]
     public class SkillData
     {
@@ -26,30 +23,28 @@ namespace RPG.Combat
         public float       ManaCost      = 10f;
         public float       Range         = 4f;
         public float       AtkMultiplier = 1.0f;
-
-        /// <summary>
-        /// Tempo base de cast em segundos. 0 = instantâneo.
-        /// Reduzido em runtime pelo CastSpeed do caster:
-        ///   effective = base / (1 + CastSpeed/100)
-        /// </summary>
-        public float CastTime = 0f;
-
-        public string AnimTrigger = "Attack";
-        public Sprite Icon;
+        public float       CastTime      = 0f;
+        public string      AnimTrigger   = "Attack";
+        public Sprite      Icon;
     }
 
     /// <summary>
-    /// Gerencia a barra de skills do jogador local: hotkeys, cooldown visual,
-    /// walk-to-range, cast (canal) e envio de comandos ao servidor.
+    /// Gerencia a barra de skills do jogador local.
     ///
-    /// === MELHORIAS DESTA VERSÃO ===
-    ///   - Cleanup completo em OnDestroy/OnDisable (cancela TODAS as coroutines).
-    ///   - Eventos limpos em OnStopClient para evitar memory leak.
-    ///   - Validação extra de skill index em pontos públicos.
-    ///   - Logs gateados por #if UNITY_EDITOR.
+    /// === MUDANÇAS DESTA VERSÃO (lag/movimento) ===
     ///
-    /// === PRINCÍPIO ===
-    ///   Toda autoridade fica no servidor — este script é apenas UX/predição.
+    ///   1. CancelPendingWalkSoft(): NOVO. Cancela o estado de walk-to-skill
+    ///      SEM tocar no NavMeshAgent. Usado pelo NetworkPlayerController
+    ///      durante click-to-move para não interromper o movimento atual.
+    ///
+    ///   2. CancelPendingWalk() agora delega para Soft + StopAgent. Use
+    ///      apenas quando realmente quiser parar.
+    ///
+    ///   3. StopAgent não zera mais velocity. ResetPath() + stoppingDistance
+    ///      ajustada. O agent desacelera naturalmente.
+    ///
+    ///   4. WalkThenSendCmd: só chama SetDestination quando o destino mudou
+    ///      significativamente (evita stutter de recálculo de path).
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     public class SkillSystem : NetworkBehaviour
@@ -57,15 +52,15 @@ namespace RPG.Combat
         [Header("Debug")]
         [SerializeField] private bool debugLogs = false;
 
-        // Tuning — alinhado com BasicAttackSystem
         public  const int   MAX_SKILLS         = 4;
-        private const float CMD_MOVE_INTERVAL  = 0.15f;
+        private const float CMD_MOVE_INTERVAL  = 0.18f;
         private const float WALK_TIMEOUT       = 15f;
         private const float WALK_DEST_FRACTION = 0.85f;
         private const float RANGE_CHECK_MARGIN = 1.05f;
-        private const float WALK_STOP_DIST     = 0.2f;
+        private const float WALK_STOP_DIST     = 0.15f;
         private const float IDLE_STOP_DIST     = 0.5f;
         private const float INSTANT_CAST_EPS   = 0.05f;
+        private const float WALK_REDIRECT_THRESHOLD = 0.5f;
 
         // ── Componentes ────────────────────────────────────────────────────
         private PlayerEntity              _player;
@@ -73,7 +68,6 @@ namespace RPG.Combat
         private NavMeshAgent              _agent;
         private NetworkPlayerController   _controller;
         private NetworkInventory          _inventory;
-        // FIX CS0104: qualificado para evitar ambiguidade com UnityEngine.NetworkPlayer (legacy, exposto por Mirror)
         private RPG.Network.NetworkPlayer _netPlayer;
         private NetworkIdentity           _identity;
 
@@ -87,6 +81,7 @@ namespace RPG.Combat
         private bool        _isCasting;
         private ITargetable _pendingTarget;
         private float       _lastCmdMoveTime;
+        private Vector3     _lastWalkDestination = Vector3.positiveInfinity;
 
         // ── Eventos para a UI ──────────────────────────────────────────────
         public event Action<int, float>    OnCooldownStarted;
@@ -126,17 +121,16 @@ namespace RPG.Combat
             if (_inventory != null)
                 _inventory.OnGemLoadoutChanged -= OnGemLoadoutChanged;
 
-            CancelPendingWalk();
+            CancelPendingWalkSoft();
             CancelCast();
         }
 
         private void OnDestroy()
         {
-            // Limpa subscrição se OnStopClient não foi chamado (cenário raro de destruição forçada)
             if (_inventory != null)
                 _inventory.OnGemLoadoutChanged -= OnGemLoadoutChanged;
 
-            CancelPendingWalk();
+            CancelPendingWalkSoft();
             CancelCast();
         }
 
@@ -150,12 +144,10 @@ namespace RPG.Combat
         {
             if (!isLocalPlayer) return;
 
-            // Decremento de cooldowns visuais
             for (int i = 0; i < MAX_SKILLS; i++)
                 if (_uiCooldownTimers[i] > 0f)
                     _uiCooldownTimers[i] -= Time.deltaTime;
 
-            // Cancela ações pendentes se o player morreu
             if ((_hasPendingWalk || _isCasting) && _player.IsDead)
             {
                 CancelPendingWalk();
@@ -163,7 +155,6 @@ namespace RPG.Combat
                 return;
             }
 
-            // Cancela walk se o alvo se tornou inválido
             if (_hasPendingWalk && !IsTargetValid(_pendingTarget))
                 CancelPendingWalk();
         }
@@ -188,7 +179,7 @@ namespace RPG.Combat
             if (!isLocalPlayer) return;
             if (index < 0 || index >= MAX_SKILLS) return;
             if (!_player.IsInitialized || _player.IsDead) return;
-            if (_isCasting) return; // não interrompe cast em andamento
+            if (_isCasting) return;
 
             var skill = GetSkill(index);
             if (skill == null)
@@ -205,7 +196,6 @@ namespace RPG.Combat
 
             CancelPendingWalk();
 
-            // Self/buff/heal: ignora alvo
             if (skill.Target == SkillTarget.Self
                 || skill.Type == SkillType.Heal
                 || skill.Type == SkillType.Buff)
@@ -214,7 +204,6 @@ namespace RPG.Combat
                 return;
             }
 
-            // Skills com alvo: precisa de alvo vivo
             var target = _player.CurrentTarget;
             if (target == null)
             {
@@ -239,10 +228,11 @@ namespace RPG.Combat
             else
             {
                 Log($"Fora de range ({dist:0.1} > {skill.Range:0.1}). Caminhando...");
-                _hasPendingWalk  = true;
-                _pendingTarget   = target;
-                _lastCmdMoveTime = -CMD_MOVE_INTERVAL;
-                _walkCoroutine   = StartCoroutine(WalkThenSendCmd(index, skill, target));
+                _hasPendingWalk      = true;
+                _pendingTarget       = target;
+                _lastCmdMoveTime     = -CMD_MOVE_INTERVAL;
+                _lastWalkDestination = Vector3.positiveInfinity;
+                _walkCoroutine       = StartCoroutine(WalkThenSendCmd(index, skill, target));
             }
         }
 
@@ -260,20 +250,33 @@ namespace RPG.Combat
             }
         }
 
+        /// <summary>
+        /// Cancela o walk-to-skill E para o agent. Use quando realmente quiser
+        /// que o player pare (ex: morte, mudança de alvo manual).
+        /// </summary>
         public void CancelPendingWalk()
+        {
+            CancelPendingWalkSoft();
+            StopAgent();
+        }
+
+        /// <summary>
+        /// NOVO: cancela apenas o ESTADO de walk-to-skill, sem mexer no agent.
+        /// Use durante click-to-move para que o player continue se movendo
+        /// para o novo destino sem parar.
+        /// </summary>
+        public void CancelPendingWalkSoft()
         {
             if (_walkCoroutine != null)
             {
                 StopCoroutine(_walkCoroutine);
                 _walkCoroutine = null;
             }
-            _hasPendingWalk = false;
-            _pendingTarget  = null;
-
-            StopAgent();
+            _hasPendingWalk      = false;
+            _pendingTarget       = null;
+            _lastWalkDestination = Vector3.positiveInfinity;
         }
 
-        /// <summary>Confirmação do servidor: aplica cooldown visual e dispara eventos.</summary>
         public void OnServerSkillConfirmed(int skillIndex, float cooldownDuration)
         {
             if (skillIndex < 0 || skillIndex >= MAX_SKILLS) return;
@@ -290,7 +293,7 @@ namespace RPG.Combat
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Cast (canal)
+        // Cast
         // ══════════════════════════════════════════════════════════════════
 
         private void StartCastAndSend(int index, SkillData skill, ITargetable target, bool isSelf)
@@ -304,13 +307,11 @@ namespace RPG.Combat
 
             if (effectiveCastTime <= INSTANT_CAST_EPS)
             {
-                // Cast instantâneo
                 if (isSelf) SendSelfSkillCmd(index);
                 else        SendSkillCmd(index, target, skill.Type == SkillType.Physical);
                 return;
             }
 
-            // Cast com tempo
             if (_castCoroutine != null) StopCoroutine(_castCoroutine);
             _castCoroutine = StartCoroutine(CastSequence(index, skill, target, isSelf, effectiveCastTime));
         }
@@ -321,13 +322,12 @@ namespace RPG.Combat
             _isCasting = true;
             OnCastStarted?.Invoke(skill.Name, castTime);
 
-            // Para o agent durante o cast (não move enquanto canaliza)
             StopAgent();
 
             if (!string.IsNullOrEmpty(skill.AnimTrigger))
                 _animator?.SetTrigger("CastStart");
 
-            float elapsed  = 0f;
+            float elapsed   = 0f;
             bool  cancelled = false;
 
             while (elapsed < castTime)
@@ -393,7 +393,7 @@ namespace RPG.Combat
                     _hasPendingWalk = false;
                     _pendingTarget  = null;
 
-                    yield return null; // 1 frame de respiro
+                    yield return null;
 
                     if (!_player.IsDead && IsTargetValid(target) && _player.CurrentTarget == target)
                     {
@@ -403,11 +403,15 @@ namespace RPG.Combat
                     yield break;
                 }
 
-                // Continua caminhando
+                // FIX: só recalcula path se o destino mudou significativamente
                 if (_agent != null && _agent.isOnNavMesh)
                 {
                     Vector3 destination = CalculateWalkDestination(target.Position, skill.Range);
-                    _agent.SetDestination(destination);
+                    if (Vector3.Distance(destination, _lastWalkDestination) >= WALK_REDIRECT_THRESHOLD)
+                    {
+                        _agent.SetDestination(destination);
+                        _lastWalkDestination = destination;
+                    }
                 }
 
                 if (Time.time - _lastCmdMoveTime >= CMD_MOVE_INTERVAL)
@@ -448,7 +452,7 @@ namespace RPG.Combat
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Envio de comandos ao servidor
+        // Envio de comandos
         // ══════════════════════════════════════════════════════════════════
 
         private void SendSkillCmd(int skillIndex, ITargetable target, bool isPhysical)
@@ -459,7 +463,6 @@ namespace RPG.Combat
             if (_animator != null && skill != null && !string.IsNullOrEmpty(skill.AnimTrigger))
                 _animator.SetTrigger(skill.AnimTrigger);
 
-            // Rotaciona instantaneamente para o alvo
             if (target != null)
             {
                 Vector3 dir = target.Position - transform.position;
@@ -468,7 +471,6 @@ namespace RPG.Combat
                     transform.rotation = Quaternion.LookRotation(dir);
             }
 
-            // Resolve o NetworkBehaviour subjacente
             if (target is not NetworkBehaviour targetNB)
             {
                 Log("Alvo não é NetworkBehaviour — skill não enviada.");
@@ -485,7 +487,6 @@ namespace RPG.Combat
             }
             else
             {
-                // PvP futuro
                 if (debugLogs)
                     UIManager.Instance?.ShowMessage("PvP ainda não implementado.");
             }
@@ -501,12 +502,16 @@ namespace RPG.Combat
         // Helpers
         // ══════════════════════════════════════════════════════════════════
 
+        /// <summary>
+        /// Para o agent suavemente: limpa path e ajusta stoppingDistance.
+        /// FIX: NÃO zera mais velocity — deixa o brake natural desacelerar.
+        /// </summary>
         private void StopAgent()
         {
             if (_agent == null || !_agent.isOnNavMesh) return;
             _agent.ResetPath();
-            _agent.velocity         = Vector3.zero;
             _agent.stoppingDistance = IDLE_STOP_DIST;
+            _lastWalkDestination    = Vector3.positiveInfinity;
         }
 
         private static bool IsTargetValid(ITargetable target)

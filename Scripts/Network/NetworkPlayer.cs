@@ -15,17 +15,20 @@ namespace RPG.Network
     /// <summary>
     /// Representação server-authoritative de um jogador no mundo.
     ///
-    /// === CORREÇÕES DESTA VERSÃO ===
+    /// === MUDANÇAS DESTA VERSÃO (lag/movimento) ===
     ///
-    ///   1. COOLDOWN POR CHAVE LONG:
-    ///      Adicionado ServerCheckAndSetCooldownLong(long, float) para suportar
-    ///      a chave estruturada de basic attack (atacante+monstro em 64 bits).
-    ///      A versão int é mantida para skills (que usam índice 0..3).
-    ///      Os dois mapas são SEPARADOS, garantindo que não há colisão de chave
-    ///      entre uma skill com índice X e um basic attack com hash X.
+    ///   1. ConfigureServerAgent: novo helper que aplica configurações
+    ///      profissionais do NavMeshAgent no servidor (autoBraking off,
+    ///      acceleration alta, angularSpeed alta).
     ///
-    ///   2. CONSTANTES VIA GameConstants:
-    ///      Caps que estavam hardcoded agora referenciam GameConstants.
+    ///   2. ServerInitialize: chama ConfigureServerAgent ao inicializar.
+    ///
+    ///   3. ServerRespawn: mesma config aplicada após Warp.
+    ///
+    ///   4. ServerRecalculateStats: mantém config (não sobrescreve).
+    ///
+    ///   5. Mantidas TODAS as funcionalidades anteriores: cooldown long,
+    ///      regen, equipamento, alocação, save, etc.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -41,6 +44,11 @@ namespace RPG.Network
         private const float REGEN_COMBAT_SUPPRESSION = 8f;
         private const float REGEN_DISPLAY_THRESHOLD  = 1f;
         private const int   MAX_FREE_POINTS          = CharacterData.MAX_LEVEL * CharacterData.POINTS_PER_LEVEL_UP;
+
+        // Configurações de NavMeshAgent para movimento fluido
+        private const float AGENT_ACCELERATION   = 60f;
+        private const float AGENT_ANGULAR_SPEED  = 720f;
+        private const float AGENT_STOPPING_DIST  = 0.15f;
 
         public struct PlayerInitData
         {
@@ -121,9 +129,7 @@ namespace RPG.Network
 
         public DerivedStats ServerStats => _serverStats;
 
-        // Dois mapas SEPARADOS para evitar colisão entre índices de skill (int pequeno)
-        // e chaves estruturadas de basic attack (long grande)
-        private readonly Dictionary<int, float>  _serverSkillCooldowns     = new();
+        private readonly Dictionary<int, float>  _serverSkillCooldowns       = new();
         private readonly Dictionary<long, float> _serverBasicAttackCooldowns = new();
 
         private Coroutine _regenCoroutine;
@@ -250,6 +256,29 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
+        // NavMeshAgent — configuração profissional
+        // ══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Aplica configurações de NavMeshAgent que reduzem stutter e jitter:
+        ///   - autoBraking off: agent não desacelera no fim do path
+        ///   - acceleration alta: arranca responsivo
+        ///   - angularSpeed alta: gira sem "andar de lado"
+        ///   - stoppingDistance baixa: aproximação justa do destino
+        /// </summary>
+        [Server]
+        private void ConfigureServerAgent()
+        {
+            if (_agent == null || _serverStats == null) return;
+
+            _agent.speed            = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
+            _agent.acceleration     = AGENT_ACCELERATION;
+            _agent.angularSpeed     = AGENT_ANGULAR_SPEED;
+            _agent.autoBraking      = false;
+            _agent.stoppingDistance = AGENT_STOPPING_DIST;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
         // Inicialização
         // ══════════════════════════════════════════════════════════════════
 
@@ -309,7 +338,9 @@ namespace RPG.Network
                 transform.position = savedPos;
                 if (_agent != null && _agent.isOnNavMesh) _agent.Warp(savedPos);
             }
-            if (_agent != null) _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
+
+            // FIX: configuração completa do agent — substitui o ajuste de speed isolado
+            ConfigureServerAgent();
 
             StartRegenLoop();
 
@@ -350,7 +381,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Mudança de equipamento → recalcular stats
+        // Mudança de equipamento
         // ══════════════════════════════════════════════════════════════════
 
         [Server]
@@ -377,6 +408,7 @@ namespace RPG.Network
             _serverCharData.CurrentHP = CurrentHP;
             _serverCharData.CurrentMP = CurrentMP;
 
+            // FIX: só ajusta velocidade, mantém demais configs (sem stomp)
             if (_agent != null && _agent.isOnNavMesh)
                 _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
 
@@ -631,9 +663,6 @@ namespace RPG.Network
             if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
         }
 
-        /// <summary>
-        /// Cooldown indexado por inteiro (usado para skills equipadas 0..3).
-        /// </summary>
         [Server]
         public bool ServerCheckAndSetCooldown(int skillIndex, float cooldownDuration)
         {
@@ -646,11 +675,6 @@ namespace RPG.Network
             return true;
         }
 
-        /// <summary>
-        /// Cooldown indexado por chave LONG ESTRUTURADA (usado para basic attack
-        /// por par atacante+monstro). Mapa SEPARADO do de skills, sem risco de
-        /// colisão.
-        /// </summary>
         [Server]
         public bool ServerCheckAndSetCooldownLong(long cooldownKey, float cooldownDuration)
         {
@@ -719,7 +743,7 @@ namespace RPG.Network
         [Server] public void ServerSaveCharacter() => ServerSaveCharacterForced();
 
         // ══════════════════════════════════════════════════════════════════
-        // API pública para outros sistemas
+        // API pública
         // ══════════════════════════════════════════════════════════════════
 
         public CharacterRace GetRaceEnum() => _cachedRace;
@@ -923,6 +947,10 @@ namespace RPG.Network
             }
 
             _lastDamageTime = -999f;
+
+            // FIX: re-aplica config completa do agent após o respawn
+            ConfigureServerAgent();
+
             StartRegenLoop();
 
             RpcOnRespawned(pos, CurrentHP, MaxHP, CurrentMP, MaxMP);

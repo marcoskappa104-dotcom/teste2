@@ -12,10 +12,27 @@ namespace RPG.Network
     /// Input do jogador local: mouse para mover/atacar/selecionar, teclado para
     /// skills, câmera orbital com anti-oclusão.
     ///
-    /// Princípios:
-    ///   - Cliente faz prediction local (SetDestination imediato).
-    ///   - CmdMoveTo só notifica o servidor para sincronização autoritativa.
-    ///   - Atalhos de teclado NÃO disparam quando o jogador digita em InputField.
+    /// === REESCRITA: MOVIMENTO ESTILO MMO (Ragnarok/PoE) ===
+    ///
+    ///   1. CLICK & HOLD: clique simples move até o ponto; SEGURAR o botão
+    ///      esquerdo faz o player seguir continuamente para onde o mouse
+    ///      aponta no chão (re-target a cada UPDATE_TARGET_INTERVAL).
+    ///
+    ///   2. REDIRECIONAMENTO SEM PARAR: clicar em outro lugar enquanto o
+    ///      player se move NÃO faz ResetPath() nem zera velocity. Apenas
+    ///      troca o destino — o agent muda de direção fluidamente.
+    ///
+    ///   3. CANCELAMENTOS INTELIGENTES: auto-ataque e walk-to-skill são
+    ///      cancelados sem tocar no agent quando o player vai continuar
+    ///      se movendo (apenas trocando destino).
+    ///
+    ///   4. THROTTLE DE Cmd: o CmdMoveTo é enviado em rate fixo, não a
+    ///      cada movimento de mouse. Reduz tráfego sem perder responsividade.
+    ///
+    ///   5. PREDIÇÃO LOCAL LIMPA: o cliente local atualiza o agent
+    ///      imediatamente; o servidor confirma de forma assíncrona via
+    ///      NetworkTransform. Não há mais "fight" porque não cancelamos
+    ///      o path corrente.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class NetworkPlayerController : NetworkBehaviour
@@ -33,6 +50,14 @@ namespace RPG.Network
         [SerializeField] private float cameraSmoothTime = 0.05f;
         [SerializeField] private float cameraHeight     = 1.5f;
 
+        [Header("Movimento (Click & Hold)")]
+        [Tooltip("Intervalo entre atualizações de destino enquanto o mouse está pressionado.")]
+        [SerializeField] private float updateTargetInterval = 0.12f;
+        [Tooltip("Intervalo entre envios de CmdMoveTo para o servidor.")]
+        [SerializeField] private float cmdMoveInterval = 0.18f;
+        [Tooltip("Distância mínima entre o destino atual e o novo para emitir SetDestination.")]
+        [SerializeField] private float redirectThreshold = 0.4f;
+
         [Header("Indicador de Movimento")]
         [SerializeField] private GameObject moveIndicatorPrefab;
 
@@ -46,6 +71,12 @@ namespace RPG.Network
         private BasicAttackSystem  _basicAttack;
         private NetworkIdentity    _identity;
         private Camera             _cam;
+
+        // ── Estado de movimento ────────────────────────────────────────────
+        private bool    _holdMoving;           // mouse esquerdo pressionado movendo
+        private Vector3 _lastSentDestination;  // último destino enviado ao servidor
+        private float   _lastTargetUpdateTime;
+        private float   _lastCmdMoveTime;
 
         // ── Câmera ─────────────────────────────────────────────────────────
         private float   _yaw         = 45f;
@@ -84,6 +115,7 @@ namespace RPG.Network
         private void OnDisable()
         {
             _orbiting        = false;
+            _holdMoving      = false;
             Cursor.visible   = true;
             Cursor.lockState = CursorLockMode.None;
         }
@@ -98,8 +130,17 @@ namespace RPG.Network
             if (_cam == null)
                 Debug.LogWarning("[NetworkPlayerController] Camera.main não encontrada.");
 
-            if (_agent != null && _playerEntity != null && _playerEntity.Stats != null)
-                _agent.speed = Mathf.Clamp(_playerEntity.Stats.MoveSpeed, 3f, 7f);
+            // FIX: configuração profissional do NavMeshAgent para movimento suave
+            if (_agent != null)
+            {
+                _agent.acceleration     = 60f;     // alta para arrancar rápido sem patinar
+                _agent.angularSpeed     = 720f;    // gira rápido sem stutter visual
+                _agent.autoBraking      = false;   // SEM brake — evita desaceleração no fim do path
+                _agent.stoppingDistance = 0.15f;
+
+                if (_playerEntity != null && _playerEntity.Stats != null)
+                    _agent.speed = Mathf.Clamp(_playerEntity.Stats.MoveSpeed, 3f, 7f);
+            }
 
             Cursor.visible   = true;
             Cursor.lockState = CursorLockMode.None;
@@ -126,23 +167,51 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Mouse
+        // Mouse — click & hold estilo Ragnarok/PoE
         // ══════════════════════════════════════════════════════════════════
 
         private void HandleMouseInput()
         {
-            if (!Input.GetMouseButtonDown(0)) return;
             if (_cam == null) return;
 
-            if (EventSystem.current != null && EventSystem.current.IsPointerOverGameObject())
-                return;
+            // Bloqueia interação se estiver sobre UI
+            bool overUI = EventSystem.current != null && EventSystem.current.IsPointerOverGameObject();
 
-            Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
+            // ── Click inicial (down) ───────────────────────────────────────
+            if (Input.GetMouseButtonDown(0) && !overUI)
+            {
+                Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
 
-            if (TryPickupItem(ray))         return;
-            if (TryHandleMonsterClick(ray)) return;
-            if (TrySelectTargetable(ray))   return;
-            TryMoveToGround(ray);
+                // Pickup e clique em monstro/alvo são prioritários e param o hold
+                if (TryPickupItem(ray))         { _holdMoving = false; return; }
+                if (TryHandleMonsterClick(ray)) { _holdMoving = false; return; }
+                if (TrySelectTargetable(ray))   { _holdMoving = false; return; }
+
+                // Caso contrário: começa movimento e habilita hold
+                if (TryMoveToGround(ray, showIndicator: true))
+                {
+                    _holdMoving           = true;
+                    _lastTargetUpdateTime = Time.time;
+                }
+            }
+
+            // ── Hold (botão pressionado) ───────────────────────────────────
+            // FIX: enquanto segurar, redireciona suavemente para onde o mouse aponta
+            if (_holdMoving && Input.GetMouseButton(0) && !overUI)
+            {
+                if (Time.time - _lastTargetUpdateTime >= updateTargetInterval)
+                {
+                    _lastTargetUpdateTime = Time.time;
+                    Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
+                    TryMoveToGround(ray, showIndicator: false);
+                }
+            }
+
+            // ── Solta o botão: para de seguir o cursor, mas mantém o destino atual ──
+            if (Input.GetMouseButtonUp(0))
+            {
+                _holdMoving = false;
+            }
         }
 
         private bool TryHandleMonsterClick(Ray ray)
@@ -195,29 +264,59 @@ namespace RPG.Network
             return true;
         }
 
-        private void TryMoveToGround(Ray ray)
+        /// <summary>
+        /// Move para um ponto no chão. NÃO PARA o agent antes — apenas troca o destino,
+        /// preservando velocity e fluidez.
+        /// </summary>
+        private bool TryMoveToGround(Ray ray, bool showIndicator)
         {
             int moveLayerMask = terrainLayer != 0
                 ? (int)terrainLayer
                 : ~(1 << LayerMask.NameToLayer("Targetable"));
 
-            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, moveLayerMask)) return;
+            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, moveLayerMask)) return false;
 
-            _skillSystem?.CancelPendingWalk();
-            _basicAttack?.CancelAutoAttack();
-            _playerEntity?.ClearTarget();
-            UIManager.Instance?.ClearTargetPanel();
+            // FIX: cancela ações pendentes SEM TOCAR no agent (sem ResetPath/velocity=0)
+            // Os sistemas de skill/auto-ataque saem do estado deles, mas o agent
+            // continua se movendo até receber o novo SetDestination logo abaixo.
+            _skillSystem?.CancelPendingWalkSoft();
+            _basicAttack?.CancelAutoAttackSoft();
+
+            // Desselecionar alvo só faz sentido no clique inicial, não no hold contínuo
+            if (showIndicator)
+            {
+                _playerEntity?.ClearTarget();
+                UIManager.Instance?.ClearTargetPanel();
+            }
 
             Vector3 dest = hit.point;
             if (NavMesh.SamplePosition(dest, out NavMeshHit navHit, 3f, NavMesh.AllAreas))
                 dest = navHit.position;
 
-            // Prediction local
-            if (_agent != null && _agent.isOnNavMesh)
-                _agent.SetDestination(dest);
+            // FIX: só redireciona se o novo destino é significativamente diferente.
+            // Evita SetDestination spam que recalcula path desnecessariamente.
+            float deltaToCurrent = Vector3.Distance(_lastSentDestination, dest);
+            bool shouldRedirect  = deltaToCurrent >= redirectThreshold;
 
-            CmdMoveTo(dest);
-            SpawnMoveIndicator(hit.point);
+            if (shouldRedirect)
+            {
+                // Predição local — SEM ResetPath, SEM velocity=0
+                if (_agent != null && _agent.isOnNavMesh)
+                    _agent.SetDestination(dest);
+
+                _lastSentDestination = dest;
+            }
+
+            // Throttle do envio ao servidor (independente de shouldRedirect, para
+            // garantir que o servidor sempre tenha o destino mais recente)
+            if (Time.time - _lastCmdMoveTime >= cmdMoveInterval)
+            {
+                _lastCmdMoveTime = Time.time;
+                CmdMoveTo(dest);
+            }
+
+            if (showIndicator) SpawnMoveIndicator(hit.point);
+            return true;
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -230,10 +329,10 @@ namespace RPG.Network
             if (_playerEntity != null && _playerEntity.IsDead) return;
             if (IsTypingInField()) return;
 
-            if (Input.GetKeyDown(KeyCode.Q)) _skillSystem.TryUseSkill(0);
-            if (Input.GetKeyDown(KeyCode.W)) _skillSystem.TryUseSkill(1);
-            if (Input.GetKeyDown(KeyCode.E)) _skillSystem.TryUseSkill(2);
-            if (Input.GetKeyDown(KeyCode.R)) _skillSystem.TryUseSkill(3);
+            if (Input.GetKeyDown(KeyCode.Q)) { _holdMoving = false; _skillSystem.TryUseSkill(0); }
+            if (Input.GetKeyDown(KeyCode.W)) { _holdMoving = false; _skillSystem.TryUseSkill(1); }
+            if (Input.GetKeyDown(KeyCode.E)) { _holdMoving = false; _skillSystem.TryUseSkill(2); }
+            if (Input.GetKeyDown(KeyCode.R)) { _holdMoving = false; _skillSystem.TryUseSkill(3); }
             if (Input.GetKeyDown(KeyCode.C)) AttributeWindowUI.Instance?.Toggle();
         }
 
@@ -253,7 +352,6 @@ namespace RPG.Network
             }
         }
 
-        /// <summary>True se o foco está num InputField/TMP_InputField.</summary>
         private static bool IsTypingInField()
         {
             var selected = EventSystem.current?.currentSelectedGameObject;
@@ -312,7 +410,6 @@ namespace RPG.Network
             Vector3    pivot = transform.position + Vector3.up * cameraHeight;
             Vector3    dir   = rot * new Vector3(0f, 0f, -1f);
 
-            // Anti-oclusão: SphereCast contra geometria
             float effectiveDistance = _distance;
             int   occlusionMask = cameraOcclusionLayer != 0
                 ? (int)cameraOcclusionLayer
@@ -327,7 +424,6 @@ namespace RPG.Network
 
             Vector3 target = pivot + dir * effectiveDistance;
 
-            // Clamp acima do chão
             if (target.y < transform.position.y + 0.5f)
                 target.y = transform.position.y + 0.5f;
 
@@ -370,6 +466,8 @@ namespace RPG.Network
                 Debug.LogWarning($"[Server] CmdMoveTo: destino fora do NavMesh para {netPlayer.CharacterName}");
             }
 
+            // FIX: SetDestination puro — sem ResetPath, sem velocity=0.
+            // O agent transita suavemente do path atual para o novo.
             _agent.SetDestination(finalDest);
         }
 
@@ -382,6 +480,7 @@ namespace RPG.Network
             enabled = value;
             if (!value)
             {
+                _holdMoving = false;
                 _basicAttack?.CancelAutoAttack();
                 _skillSystem?.CancelPendingWalk();
 

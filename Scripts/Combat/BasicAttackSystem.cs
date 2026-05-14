@@ -13,18 +13,23 @@ namespace RPG.Combat
     /// Disparado por duplo-clique em um monstro. Persegue até entrar no range,
     /// para, ataca em intervalos de 1/ASPD, e cancela se o alvo morrer ou mudar.
     ///
-    /// === MELHORIAS DESTA VERSÃO ===
-    ///   - Cleanup completo em OnDisable/OnStopClient (cancela auto-ataque).
-    ///   - Logs gateados por #if UNITY_EDITOR && DEBUG (sem overhead em produção).
-    ///   - Throttle adicional no CmdMoveTo via deltaTime acumulado (mais estável).
-    ///   - Validação extra de target nullity em todos pontos.
-    ///   - Cache do Camera.main NÃO é usado (a câmera pode trocar entre cenas).
+    /// === MUDANÇAS DESTA VERSÃO (lag/movimento) ===
     ///
-    /// === PRINCÍPIOS ===
-    ///   - Tudo aqui é client-side prediction/UX. O dano real é decidido pelo
-    ///     servidor via CmdBasicAttack.
-    ///   - Movimento durante perseguição usa um destino a (range * DEST_FRACTION)
-    ///     para o player parar dentro do range com folga, sem sobrepor o alvo.
+    ///   1. CancelAutoAttackSoft(): NOVO. Cancela o estado de auto-ataque
+    ///      SEM tocar no NavMeshAgent (sem ResetPath, sem velocity=0). Usado
+    ///      pelo NetworkPlayerController quando o player clica em outro lugar
+    ///      para se mover — não queremos parar o agent, só sair do estado de
+    ///      auto-ataque.
+    ///
+    ///   2. CancelAutoAttack() agora delega para Soft + chama StopAgentMovement
+    ///      APENAS quando realmente queremos parar (ex: alvo morreu).
+    ///
+    ///   3. StopAgentMovement não zera velocity. Apenas ResetPath() + ajusta
+    ///      stoppingDistance. O agent desacelera naturalmente em vez de
+    ///      teleportar para velocidade zero.
+    ///
+    ///   4. ChaseTarget: pre-condiciona stoppingDistance UMA VEZ, evita
+    ///      SetDestination redundante se já vamos para o mesmo ponto.
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -44,19 +49,22 @@ namespace RPG.Combat
         [SerializeField] private float doubleClickTime = 0.35f;
 
         [Tooltip("Frequência máxima de envio de CmdMoveTo durante perseguição (s).")]
-        [SerializeField] private float moveCommandInterval = 0.15f;
+        [SerializeField] private float moveCommandInterval = 0.18f;
+
+        [Tooltip("Distância mínima para considerar troca de destino na perseguição.")]
+        [SerializeField] private float chaseRedirectThreshold = 0.5f;
 
         [Header("Debug")]
         [SerializeField] private bool debugLogs = false;
 
-        // Constantes de tuning — não mexer sem testar perseguição/kite
-        private const float DEST_FRACTION      = 0.80f;  // destino a 80% do range
-        private const float RANGE_CHECK_MARGIN = 1.05f;  // tolerância anti-jitter
-        private const float CHASE_STOP_DIST    = 0.2f;   // stoppingDistance fixo
-        private const float IDLE_STOP_DIST     = 0.5f;   // stoppingDistance quando parado
+        // Constantes de tuning
+        private const float DEST_FRACTION      = 0.80f;
+        private const float RANGE_CHECK_MARGIN = 1.05f;
+        private const float CHASE_STOP_DIST    = 0.15f;
+        private const float IDLE_STOP_DIST     = 0.5f;
         private const float MIN_INTERVAL       = 0.3f;
         private const float MAX_INTERVAL       = 3f;
-        private const float ROTATION_SPEED     = 10f;
+        private const float ROTATION_SPEED     = 12f;
 
         // ── Componentes ────────────────────────────────────────────────────
         private PlayerEntity            _player;
@@ -66,13 +74,13 @@ namespace RPG.Combat
         private SkillSystem             _skillSystem;
         private NetworkIdentity         _identity;
 
-        // ── Estado de auto-ataque ──────────────────────────────────────────
+        // ── Estado ─────────────────────────────────────────────────────────
         private NetworkMonsterEntity _attackTarget;
         private bool                 _autoAttacking;
         private float                _attackTimer;
         private float                _lastMoveCmd;
+        private Vector3              _lastChaseDestination = Vector3.positiveInfinity;
 
-        // ── Estado de duplo-clique ─────────────────────────────────────────
         private float                _lastClickTime = -999f;
         private NetworkMonsterEntity _lastClickTarget;
 
@@ -93,14 +101,12 @@ namespace RPG.Combat
 
         public override void OnStopClient()
         {
-            // Garante cleanup ao destruir/despawnar
-            CancelAutoAttack();
+            CancelAutoAttackSoft();
         }
 
         private void OnDisable()
         {
-            // Cancelar auto-ataque ao desabilitar (ex: morte)
-            if (_autoAttacking) CancelAutoAttack();
+            if (_autoAttacking) CancelAutoAttackSoft();
         }
 
         private void Update()
@@ -112,10 +118,6 @@ namespace RPG.Combat
 
         // ── API pública ────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Registra um clique no monstro e inicia auto-ataque se for duplo-clique.
-        /// Retorna true se um duplo-clique foi reconhecido.
-        /// </summary>
         public bool TryRegisterClick(NetworkMonsterEntity monster)
         {
             if (IsTargetGone(monster)) return false;
@@ -135,27 +137,43 @@ namespace RPG.Combat
             return false;
         }
 
+        /// <summary>
+        /// Cancela o auto-ataque E para o agent. Use quando realmente quiser
+        /// que o player pare (ex: morte, mudança de UI, alvo morto).
+        /// </summary>
         public void CancelAutoAttack()
         {
             if (!_autoAttacking) return;
-
-            _autoAttacking = false;
-            _attackTarget  = null;
-
+            CancelAutoAttackSoft();
             StopAgentMovement();
-            Log("Auto-ataque cancelado.");
+        }
+
+        /// <summary>
+        /// NOVO: cancela apenas o ESTADO de auto-ataque, sem mexer no agent.
+        /// Use quando o player vai continuar se movendo (clique para mover noutro
+        /// ponto). Evita o jitter de parar-acelerar.
+        /// </summary>
+        public void CancelAutoAttackSoft()
+        {
+            if (!_autoAttacking) return;
+
+            _autoAttacking        = false;
+            _attackTarget         = null;
+            _lastChaseDestination = Vector3.positiveInfinity;
+            Log("Auto-ataque cancelado (soft).");
         }
 
         // ── Início ─────────────────────────────────────────────────────────
 
         private void StartAutoAttack(NetworkMonsterEntity monster)
         {
-            _skillSystem?.CancelPendingWalk();
-            CancelAutoAttack();
+            _skillSystem?.CancelPendingWalkSoft();
+            CancelAutoAttackSoft();
 
-            _attackTarget  = monster;
-            _autoAttacking = true;
-            _attackTimer   = GetAttackInterval();
+            _attackTarget         = monster;
+            _autoAttacking        = true;
+            _attackTimer          = GetAttackInterval();
+            _lastChaseDestination = Vector3.positiveInfinity;
 
             _player.SetTarget(monster);
             UIManager.Instance?.UpdateTargetPanel(monster);
@@ -167,7 +185,6 @@ namespace RPG.Combat
 
         private void UpdateAutoAttack()
         {
-            // 1) Alvo morreu ou foi destruído?
             if (IsTargetGone(_attackTarget))
             {
                 Log("Alvo destruído ou morto — cancelando.");
@@ -177,14 +194,12 @@ namespace RPG.Combat
                 return;
             }
 
-            // 2) Jogador trocou de alvo manualmente?
             if (!IsCurrentTargetStillSame())
             {
-                CancelAutoAttack();
+                CancelAutoAttackSoft();
                 return;
             }
 
-            // 3) Dentro do range? Ataca. Fora? Persegue.
             float dist           = Vector3.Distance(transform.position, _attackTarget.Position);
             float effectiveRange = attackRange * RANGE_CHECK_MARGIN;
 
@@ -196,9 +211,16 @@ namespace RPG.Combat
 
         private void AttackTarget()
         {
-            // Para o agent (no range)
+            // FIX: para o agent SUAVEMENTE — apenas se ainda tem path.
+            // Não chamamos StopAgentMovement aqui porque o agent já vai parar
+            // naturalmente ao chegar perto do alvo (autoBraking lida com isso).
             if (_agent != null && _agent.isOnNavMesh && _agent.hasPath)
-                StopAgentMovement();
+            {
+                // Apenas remove o path; deixa o brake natural cuidar da desaceleração
+                _agent.ResetPath();
+                _agent.stoppingDistance = IDLE_STOP_DIST;
+                _lastChaseDestination   = Vector3.positiveInfinity;
+            }
 
             _attackTimer += Time.deltaTime;
             if (_attackTimer >= GetAttackInterval())
@@ -225,21 +247,25 @@ namespace RPG.Combat
 
         private void ChaseTarget()
         {
-            if (_attackTarget == null) return;
+            if (_attackTarget == null || _agent == null || !_agent.isOnNavMesh) return;
 
-            if (_agent != null && _agent.isOnNavMesh)
+            Vector3 destination = CalculateChaseDestination(_attackTarget.Position);
+
+            // FIX: só chama SetDestination quando o destino mudou significativamente.
+            // SetDestination repetido com mesmo valor causa recálculo de path,
+            // que é o que produz o "stutter" durante perseguição.
+            if (Vector3.Distance(destination, _lastChaseDestination) >= chaseRedirectThreshold)
             {
-                Vector3 destination = CalculateChaseDestination(_attackTarget.Position);
                 _agent.stoppingDistance = CHASE_STOP_DIST;
                 _agent.SetDestination(destination);
+                _lastChaseDestination = destination;
             }
 
-            // Throttle do CmdMoveTo (cliente faz prediction; servidor recebe periodicamente)
+            // Throttle do envio ao servidor
             if (Time.time - _lastMoveCmd >= moveCommandInterval)
             {
                 _lastMoveCmd = Time.time;
-                Vector3 serverDest = CalculateChaseDestination(_attackTarget.Position);
-                _controller?.CmdMoveTo(serverDest);
+                _controller?.CmdMoveTo(destination);
             }
         }
 
@@ -286,18 +312,18 @@ namespace RPG.Combat
             return attackInterval;
         }
 
+        /// <summary>
+        /// Para o agent de forma suave: limpa path e ajusta stoppingDistance.
+        /// FIX: NÃO zera mais velocity (deixa o brake natural desacelerar).
+        /// </summary>
         private void StopAgentMovement()
         {
             if (_agent == null || !_agent.isOnNavMesh) return;
             _agent.ResetPath();
-            _agent.velocity         = Vector3.zero;
             _agent.stoppingDistance = IDLE_STOP_DIST;
+            _lastChaseDestination   = Vector3.positiveInfinity;
         }
 
-        /// <summary>
-        /// Verifica se o PlayerEntity ainda tem como CurrentTarget o mesmo monstro.
-        /// Compara por instância de Unity Object para evitar problemas de boxing.
-        /// </summary>
         private bool IsCurrentTargetStillSame()
         {
             if (_player.CurrentTarget == null) return false;
