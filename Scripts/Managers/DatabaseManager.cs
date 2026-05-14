@@ -99,7 +99,6 @@ namespace RPG.Managers
     }
 
 #else
-    // Stubs sem propriedades para cliente compilar
     public class AccountRow      { public string Username; public string PasswordHash; public string CreatedAt; public string LastLogin; }
     public class CharacterRow    { public string CharacterId; public string Username; public string CharacterName; public int Race; public int Level=1; public long Experience; public long ExpToNext=100; public float CurrentHP=100f; public float CurrentMP=50f; public float PosX, PosY=1f, PosZ; public string CurrentMap="World_01"; public int FreePoints; public int AllocSTR, AllocAGI, AllocVIT, AllocDEX, AllocINT, AllocLUK; public int BaseSTR=10, BaseAGI=10, BaseVIT=10, BaseDEX=10, BaseINT=10, BaseLUK=10; }
     public class InventoryRow    { public int Id; public string CharacterId; public string ItemId; public int Quantity=1; public int SlotIndex=-1; public bool IsEquipped; }
@@ -111,20 +110,57 @@ namespace RPG.Managers
     // ══════════════════════════════════════════════════════════════════════
 
     /// <summary>
+    /// Resultado de tentativa de login. Inclui delay sugerido para mitigação
+    /// de timing-attack — o ServerAuthManager aplica esse delay de forma
+    /// NÃO-BLOQUEANTE via coroutine (não trava o main thread).
+    /// </summary>
+    public readonly struct LoginAttemptResult
+    {
+        public readonly AccountData Account;
+        public readonly int         SuggestedDelayMs;
+
+        public bool Success => Account != null;
+
+        public LoginAttemptResult(AccountData account, int delayMs)
+        {
+            Account          = account;
+            SuggestedDelayMs = delayMs;
+        }
+    }
+
+    /// <summary>
     /// Persistência em SQLite. Compila integralmente apenas em UNITY_SERVER.
     ///
     /// Arquitetura:
-    ///   - Leituras: síncronas, com lock no _dbLock.
-    ///   - Escritas: enfileiradas e processadas por uma thread dedicada.
-    ///     Isso evita travar o main thread em I/O. A queue é drenada na
-    ///     ordem de inserção, então a sequência lógica é preservada.
-    ///   - Atomicidade: operações que modificam múltiplas linhas (SaveInventory,
-    ///     SaveEquipped) rodam dentro de RunInTransaction para evitar estado
-    ///     inconsistente em caso de crash.
+    ///   - Leituras: síncronas, com lock no _dbLock. Rápidas o suficiente
+    ///     para serem chamadas do main thread.
+    ///   - Escritas: enfileiradas e processadas por thread dedicada.
+    ///   - Atomicidade: SaveInventory/SaveEquipped usam RunInTransaction.
+    ///
+    /// === CORREÇÕES DESTA VERSÃO ===
+    ///
+    ///   1. SEM Thread.Sleep NO MAIN THREAD:
+    ///      O login falho não usa mais `Thread.Sleep(40-80ms)` que travava
+    ///      o servidor inteiro para todos os jogadores. Agora retornamos
+    ///      LoginAttemptResult com um SuggestedDelayMs; o ServerAuthManager
+    ///      atrasa o envio da resposta via coroutine (não-bloqueante).
+    ///
+    ///   2. RNG SAFE FOR DELAY:
+    ///      O delay é gerado com `_secureRng` (System.Random), que é
+    ///      thread-safe para nosso uso (com lock) e independente do
+    ///      Unity engine.
     /// </summary>
     public class DatabaseManager : MonoBehaviour
     {
         public static DatabaseManager Instance { get; private set; }
+
+        // ── RNG para delays anti-timing-attack ─────────────────────────────
+        // Não usamos UnityEngine.Random aqui porque não queremos depender do
+        // engine para esta lógica (e queremos ser explícitos quanto à intenção)
+        private static readonly System.Random _delayRng     = new System.Random();
+        private static readonly object        _delayRngLock = new object();
+        private const int LOGIN_FAIL_DELAY_MIN_MS = 40;
+        private const int LOGIN_FAIL_DELAY_MAX_MS = 80;
 
 #if UNITY_SERVER
         private SQLiteConnection                 _db;
@@ -165,6 +201,16 @@ namespace RPG.Managers
             lock (_dbLock) { _db?.Close(); _db = null; }
             Debug.Log("[DatabaseManager] Banco fechado.");
 #endif
+        }
+
+        /// <summary>
+        /// Gera um delay aleatório (em ms) usado para mitigar timing attacks
+        /// em login falho. Thread-safe.
+        /// </summary>
+        private static int GetRandomLoginFailDelayMs()
+        {
+            lock (_delayRngLock)
+                return _delayRng.Next(LOGIN_FAIL_DELAY_MIN_MS, LOGIN_FAIL_DELAY_MAX_MS + 1);
         }
 
 #if UNITY_SERVER
@@ -219,7 +265,6 @@ namespace RPG.Managers
                 _writeEvent.Reset();
                 DrainQueue();
             }
-            // Flush final ao encerrar
             DrainQueue();
         }
 
@@ -289,12 +334,18 @@ namespace RPG.Managers
             }
         }
 
-        public AccountData TryLoginWithSignedHash(string username, string clientSignedHash, string sessionNonce)
+        /// <summary>
+        /// Valida credenciais. NÃO bloqueia o main thread em caso de falha —
+        /// o delay anti-timing-attack é retornado em SuggestedDelayMs e deve
+        /// ser aplicado pelo caller de forma assíncrona (coroutine).
+        /// </summary>
+        public LoginAttemptResult TryLoginWithSignedHash(
+            string username, string clientSignedHash, string sessionNonce)
         {
             if (string.IsNullOrWhiteSpace(username)
                 || string.IsNullOrWhiteSpace(clientSignedHash)
                 || string.IsNullOrWhiteSpace(sessionNonce))
-                return null;
+                return new LoginAttemptResult(null, 0);
 
             try
             {
@@ -308,30 +359,33 @@ namespace RPG.Managers
 
                 if (row == null)
                 {
-                    // Pequeno delay para nivelar com o tempo de validação real
-                    // (mitiga timing attacks que distinguem "user inexistente" vs "senha errada")
-                    Thread.Sleep(UnityEngine.Random.Range(40, 80));
-                    return null;
+                    // Falha por usuário inexistente: sugere delay assíncrono
+                    return new LoginAttemptResult(null, GetRandomLoginFailDelayMs());
                 }
 
                 bool valid = GameManager.ValidateLoginWithNonce(
                     row.PasswordHash, clientSignedHash, sessionNonce);
 
-                if (!valid) return null;
+                if (!valid)
+                {
+                    // Falha por senha errada: também sugere delay assíncrono
+                    return new LoginAttemptResult(null, GetRandomLoginFailDelayMs());
+                }
 
                 UpdateLastLogin(row.Username);
 
-                return new AccountData
+                var account = new AccountData
                 {
                     Username     = row.Username,
                     PasswordHash = row.PasswordHash,
                     Characters   = LoadCharacters(row.Username)
                 };
+                return new LoginAttemptResult(account, 0);
             }
             catch (Exception e)
             {
                 Debug.LogError($"[DB] TryLoginWithSignedHash: {e.Message}");
-                return null;
+                return new LoginAttemptResult(null, 0);
             }
         }
 
@@ -480,8 +534,6 @@ namespace RPG.Managers
         {
             if (ch == null || string.IsNullOrWhiteSpace(ch.CharacterId)) return;
 
-            // Captura todos os campos como locais para evitar race conditions
-            // (a action vai rodar em outra thread; não pode acessar ch livremente)
             string charId  = ch.CharacterId;
             string uname   = username?.Trim() ?? "";
             int    level   = ch.Level;
@@ -551,10 +603,6 @@ namespace RPG.Managers
             }
         }
 
-        /// <summary>
-        /// DELETE + INSERT em massa dentro de uma transação.
-        /// Antes não era transacional: crash entre o DELETE e os INSERTs perdia inventário.
-        /// </summary>
         public void SaveInventory(string characterId, string username, List<InventorySlotData> slots)
         {
             if (string.IsNullOrWhiteSpace(characterId)) return;
@@ -784,7 +832,8 @@ namespace RPG.Managers
         // ── Stubs cliente/editor ───────────────────────────────────────────
         public bool                  AccountExists(string u) => false;
         public string                TryCreateAccount(string u, string h) => null;
-        public AccountData           TryLoginWithSignedHash(string u, string sh, string n) => null;
+        public LoginAttemptResult    TryLoginWithSignedHash(string u, string sh, string n)
+                                       => new LoginAttemptResult(null, 0);
         public List<CharacterData>   LoadCharacters(string u) => new List<CharacterData>();
         public CharacterData         LoadCharacter(string id) => null;
         public CharacterData         LoadCharacterForAccount(string id, string u) => null;

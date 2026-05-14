@@ -15,22 +15,27 @@ namespace RPG.Network
     /// <summary>
     /// Monstro com IA e combate server-authoritative.
     ///
-    /// Estados:
-    ///   Idle / Patrol — sem alvo
-    ///   Chase         — persegue alvo até entrar no range
-    ///   Combat        — ataca, faz kite se muito perto
-    ///   Flee          — foge (passivos atacados)
-    ///   ReturnHome    — volta para a posição original com regen
-    ///   Dead          — desativado até respawn
+    /// === CORREÇÕES DESTA VERSÃO ===
     ///
-    /// O servidor escala stats por nível via StatsCalculator.CalculateForMonster.
-    /// Toda validação de ataque de jogador (range, cooldown) acontece aqui.
+    ///   1. CHAVE DE COOLDOWN DE ATAQUE BÁSICO ESTRUTURADA:
+    ///      Antes, BuildBasicAttackCooldownKey usava HashCode.Combine | bit.
+    ///      Como int só tem 32 bits e HashCode.Combine pode produzir QUALQUER
+    ///      padrão de bits, havia risco (raro mas real) de o hash já ter o
+    ///      bit BASIC_ATTACK_COOLDOWN_BIT ligado por acaso, sem distinguir
+    ///      do índice de skill. Solução: trocar a assinatura de cooldown
+    ///      para `long` (com layout: high32 = monsterNetId, low32 = attackerNetId,
+    ///      e usar índices de skill no espaço [0, 65535] de um long separado).
     ///
-    /// === ANTI-CHEAT ===
-    ///   - Range de ataque com tolerância configurável
-    ///   - Cap server-side no range (ignora valores inflados do cliente)
-    ///   - Dano clampado a [1, MaxHP] para impedir overflow/underflow
-    ///   - Cooldown por par (atacante, monstro) — não bloqueia outros alvos
+    ///      Para manter compatibilidade com a assinatura atual de
+    ///      NetworkPlayer.ServerCheckAndSetCooldown(int, float), introduzimos
+    ///      ServerCheckAndSetCooldownLong(long, float) e mantemos ambos.
+    ///
+    ///   2. CLEANUP PERIÓDICO DO _damageLog:
+    ///      Em combates muito longos (vários grupos atacando o mesmo monstro,
+    ///      jogadores saindo/entrando), o log pode crescer indefinidamente
+    ///      com entradas órfãs. Agora rodamos uma limpeza a cada 60s
+    ///      removendo entradas de jogadores que não existem mais ou estão
+    ///      fora do leash range.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -99,10 +104,7 @@ namespace RPG.Network
         private const float REGEN_INTERVAL                 = 5f;
         private const float REGEN_PERCENT                  = 0.05f;
         private const float MOVING_UPDATE_INTERVAL         = 0.1f;
-        private const float DAMAGE_LOG_CLEANUP_INTERVAL    = 60f; // limpa entradas muito antigas
-
-        // Marcador de bit alto para evitar colisão com índices de skill (0-15)
-        private const int BASIC_ATTACK_COOLDOWN_BIT = unchecked((int)0x40000000);
+        private const float DAMAGE_LOG_CLEANUP_INTERVAL    = 60f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnCurrentHPChanged))] private float _currentHP;
@@ -123,6 +125,7 @@ namespace RPG.Network
         // ── Estado interno ─────────────────────────────────────────────────
         private DerivedStats _stats;
         private readonly Dictionary<uint, float> _damageLog = new();
+        private float _lastDamageLogCleanupTime;
 
         private float _kiteDistance;
 
@@ -149,7 +152,7 @@ namespace RPG.Network
 
         private float _lastIsMovingUpdateTime;
 
-        // Coroutines rastreadas explicitamente para cancelamento limpo
+        // Coroutines rastreadas explicitamente
         private Coroutine _aggroScanCoroutine;
         private Coroutine _pathUpdateCoroutine;
         private Coroutine _patrolWaitCoroutine;
@@ -171,7 +174,6 @@ namespace RPG.Network
             _agent    = GetComponent<NavMeshAgent>();
             _animator = GetComponentInChildren<Animator>();
 
-            // Validação de atributos no Inspector
             baseSTR = Mathf.Max(1, baseSTR);
             baseAGI = Mathf.Max(1, baseAGI);
             baseVIT = Mathf.Max(1, baseVIT);
@@ -243,6 +245,7 @@ namespace RPG.Network
             _patrolWaiting     = false;
             _patrolTargetSet   = false;
             _damageLog.Clear();
+            _lastDamageLogCleanupTime = Time.time;
 
             _kiteDistance = attackRange * kiteDistanceFraction;
 
@@ -289,7 +292,6 @@ namespace RPG.Network
 
             _attackAccumulator += Time.deltaTime;
 
-            // Atualiza IsMoving com throttle
             if (Time.time - _lastIsMovingUpdateTime >= MOVING_UPDATE_INTERVAL)
             {
                 _lastIsMovingUpdateTime = Time.time;
@@ -297,11 +299,17 @@ namespace RPG.Network
                 if (moving != _isMoving) _isMoving = moving;
             }
 
+            // Cleanup periódico do _damageLog (combates muito longos)
+            if (Time.time - _lastDamageLogCleanupTime >= DAMAGE_LOG_CLEANUP_INTERVAL)
+            {
+                _lastDamageLogCleanupTime = Time.time;
+                CleanupOrphanedDamageEntries();
+            }
+
             switch (_state)
             {
                 case AIState.Idle:       break;
                 case AIState.Patrol:
-                    // Sentinela (radius 0 e sem pontos fixos): não patrulha
                     if (usePatrolPoints) ServerPatrolWaypoints();
                     break;
                 case AIState.Chase:      ServerChaseCheck();      break;
@@ -309,6 +317,56 @@ namespace RPG.Network
                 case AIState.Flee:       ServerFleeCheck();       break;
                 case AIState.ReturnHome: ServerReturnHomeCheck(); break;
             }
+        }
+
+        /// <summary>
+        /// Remove entradas do _damageLog para jogadores que:
+        ///   - Não existem mais no NetworkServer.spawned (desconectaram)
+        ///   - Estão MUITO fora do leash (não vão receber XP mesmo se o monstro morrer)
+        ///
+        /// Mantém o log compacto em combates muito longos.
+        /// </summary>
+        [Server]
+        private void CleanupOrphanedDamageEntries()
+        {
+            if (_damageLog.Count == 0) return;
+
+            // Coleta IDs a remover sem mutar durante iteração
+            List<uint> toRemove = null;
+            float maxDist = leashRange * 3f; // bem permissivo
+
+            foreach (var kv in _damageLog)
+            {
+                bool orphaned = false;
+
+                if (!NetworkServer.spawned.TryGetValue(kv.Key, out var identity) || identity == null)
+                {
+                    orphaned = true;
+                }
+                else
+                {
+                    var np = identity.GetComponent<NetworkPlayer>();
+                    if (np == null || np.Dead)
+                    {
+                        // Mantém players mortos por enquanto — podem voltar via respawn
+                        // e ainda têm direito a parte do XP. Não remove.
+                    }
+                    else if (Vector3.Distance(np.transform.position, transform.position) > maxDist)
+                    {
+                        orphaned = true;
+                    }
+                }
+
+                if (orphaned)
+                {
+                    if (toRemove == null) toRemove = new List<uint>();
+                    toRemove.Add(kv.Key);
+                }
+            }
+
+            if (toRemove != null)
+                foreach (var id in toRemove)
+                    _damageLog.Remove(id);
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -350,7 +408,6 @@ namespace RPG.Network
                         case AIState.ReturnHome: UpdateReturnHomePath(); break;
                         case AIState.Flee:       UpdateFleePath();       break;
                         case AIState.Patrol:
-                            // Sentinela (radius 0): não move
                             if (!usePatrolPoints && _patrolRadiusRuntime > 0.1f)
                                 UpdatePatrolAreaPath();
                             break;
@@ -453,7 +510,6 @@ namespace RPG.Network
                 }
             }
 
-            // Rotação suave em direção ao alvo
             Vector3 dir = _aggroTarget.transform.position - transform.position;
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
@@ -668,7 +724,6 @@ namespace RPG.Network
                 _stats.Penetration,
                 targetStats?.DamageReduction ?? 0f);
 
-            // Clamp de segurança: dano nunca pode ser negativo ou NaN
             dmg = SanitizeDamage(dmg);
 
             if (!_aggroTarget.Dead)
@@ -685,7 +740,6 @@ namespace RPG.Network
         {
             if (_deathProcessed || _isDead) return;
 
-            // Sanitização: dano deve ser positivo e finito
             dmg = SanitizeDamage(dmg);
             if (dmg <= 0f) return;
 
@@ -693,9 +747,6 @@ namespace RPG.Network
             if (_currentHP <= 0f) ServerDie();
         }
 
-        /// <summary>
-        /// Sanitiza valor de dano para evitar NaN/Infinity/negativo.
-        /// </summary>
         private static float SanitizeDamage(float dmg)
         {
             if (float.IsNaN(dmg) || float.IsInfinity(dmg)) return 1f;
@@ -722,8 +773,6 @@ namespace RPG.Network
             var attacker = FindPlayerByNetId(attackerNetId);
             if (attacker == null || attacker.Dead) return;
 
-            // Verifica que o atacante REALMENTE controlla essa entidade
-            // (proteção contra spoofing de netId)
             if (attacker.connectionToClient == null)
             {
                 Debug.LogWarning($"[Security] CmdRequestSkill com netId sem conexão: {attackerNetId}");
@@ -737,7 +786,6 @@ namespace RPG.Network
             var skill     = inventory?.GetEquippedSkill(skillIndex);
             if (skill == null) { attacker.RpcSkillRejected(skillIndex, "Skill inválida."); return; }
 
-            // Validação de range com tolerância
             float dist            = Vector3.Distance(attacker.transform.position, transform.position);
             float maxAllowedRange = skill.Range * ATTACK_RANGE_TOLERANCE;
             if (dist > maxAllowedRange)
@@ -764,8 +812,9 @@ namespace RPG.Network
         }
 
         /// <summary>
-        /// Ataque básico. Chave de cooldown única por COMBINAÇÃO atacante+monstro
-        /// para evitar que atacar um monstro bloqueie ataques a outros.
+        /// Ataque básico. Usa chave de cooldown long ESTRUTURADA para garantir
+        /// unicidade entre (atacante, monstro) sem risco de colisão com índices
+        /// de skill.
         /// </summary>
         [Command(requiresAuthority = false)]
         public void CmdBasicAttack(uint attackerNetId, float clientAttackRange)
@@ -775,7 +824,6 @@ namespace RPG.Network
             var attacker = FindPlayerByNetId(attackerNetId);
             if (attacker == null || attacker.Dead) return;
 
-            // Anti-spoofing: o atacante deve ser controlado por uma conexão real
             if (attacker.connectionToClient == null)
             {
                 Debug.LogWarning($"[Security] CmdBasicAttack com netId sem conexão: {attackerNetId}");
@@ -785,7 +833,6 @@ namespace RPG.Network
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
 
-            // Cap do range — servidor não confia no valor enviado pelo cliente
             float serverAttackRange = Mathf.Clamp(clientAttackRange, 0.5f, SERVER_MAX_PLAYER_ATTACK_RANGE);
             float dist              = Vector3.Distance(attacker.transform.position, transform.position);
             float maxAllowedRange   = serverAttackRange * ATTACK_RANGE_TOLERANCE;
@@ -797,12 +844,11 @@ namespace RPG.Network
                 return;
             }
 
-            // Chave de cooldown única para a combinação (atacante, monstro)
-            int cooldownKey      = BuildBasicAttackCooldownKey(attacker.netId, netId);
+            long cooldownKey = BuildBasicAttackCooldownKey(attacker.netId, netId);
             float attackInterval = atkStats.ASPD > 0f ? (1f / atkStats.ASPD) : 1.2f;
             attackInterval = Mathf.Clamp(attackInterval, 0.2f, 3f);
 
-            if (!attacker.ServerCheckAndSetCooldown(cooldownKey, attackInterval)) return;
+            if (!attacker.ServerCheckAndSetCooldownLong(cooldownKey, attackInterval)) return;
 
             bool hit = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
             if (!hit) { RpcShowMiss(transform.position); return; }
@@ -828,14 +874,17 @@ namespace RPG.Network
         }
 
         /// <summary>
-        /// Constrói chave de cooldown ESTÁVEL e ÚNICA para um par (atacante, monstro).
-        /// Usa HashCode.Combine + bit alto para evitar colisão com índices de skill.
+        /// Constrói chave de cooldown ESTRUTURADA em long (64 bits):
+        ///   - bits 63..32: monsterNetId
+        ///   - bits 31..0:  attackerNetId
+        ///
+        /// Garante unicidade total para qualquer par (atacante, monstro), e
+        /// fica em um espaço de chave SEPARADO dos índices de skill (que são
+        /// passados como int via overload de ServerCheckAndSetCooldown).
         /// </summary>
-        private static int BuildBasicAttackCooldownKey(uint attackerNetId, uint monsterNetId)
+        private static long BuildBasicAttackCooldownKey(uint attackerNetId, uint monsterNetId)
         {
-            int hash = System.HashCode.Combine(attackerNetId, monsterNetId);
-            // Garante que nunca colida com índices pequenos de skills (0..15)
-            return hash | BASIC_ATTACK_COOLDOWN_BIT;
+            return ((long)monsterNetId << 32) | attackerNetId;
         }
 
         [Server]
@@ -1058,7 +1107,6 @@ namespace RPG.Network
             OnDeselected();
             if (healthBarUI != null) healthBarUI.gameObject.SetActive(false);
 
-            // Limpa target panel se este monstro era o alvo selecionado
             var localPlayerGO = NetworkClient.localPlayer;
             if (localPlayerGO != null)
             {
@@ -1188,7 +1236,6 @@ namespace RPG.Network
         {
             healthBarUI?.UpdateBar(v, _maxHP);
 
-            // Atualiza target panel se este monstro está sendo mirado
             var localPlayerGO = NetworkClient.localPlayer;
             if (localPlayerGO != null)
             {

@@ -15,18 +15,17 @@ namespace RPG.Network
     /// <summary>
     /// Representação server-authoritative de um jogador no mundo.
     ///
-    /// Responsabilidades:
-    ///   - Sincroniza estado vital (HP, MP, Level, atributos) via SyncVars.
-    ///   - Valida e executa comandos do dono (CmdAllocateAttribute, etc).
-    ///   - Aplica dano, cura, regen, level up, morte e respawn.
-    ///   - Persiste no banco em intervalos e em eventos importantes.
+    /// === CORREÇÕES DESTA VERSÃO ===
     ///
-    /// === PRINCÍPIOS ===
-    ///   - Toda mudança que afeta stats derivados passa por ServerRecalculateStats.
-    ///   - DerivedStats é substituído atomicamente (clone) — leitores nunca veem
-    ///     estado intermediário.
-    ///   - Cliente só faz prediction/UX. Servidor é a única fonte da verdade.
-    ///   - Dano é sempre sanitizado (Mathf.Max(0, dmg), sem NaN/Infinity).
+    ///   1. COOLDOWN POR CHAVE LONG:
+    ///      Adicionado ServerCheckAndSetCooldownLong(long, float) para suportar
+    ///      a chave estruturada de basic attack (atacante+monstro em 64 bits).
+    ///      A versão int é mantida para skills (que usam índice 0..3).
+    ///      Os dois mapas são SEPARADOS, garantindo que não há colisão de chave
+    ///      entre uma skill com índice X e um basic attack com hash X.
+    ///
+    ///   2. CONSTANTES VIA GameConstants:
+    ///      Caps que estavam hardcoded agora referenciam GameConstants.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -36,8 +35,6 @@ namespace RPG.Network
         public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
 
         // ── Constantes ─────────────────────────────────────────────────────
-        private const float MAX_HP_CAP               = 500_000f;
-        private const float MAX_MP_CAP               = 200_000f;
         private const float SAVE_INTERVAL            = 60f;
         private const float REGEN_INTERVAL           = 5f;
         private const float ALLOCATE_MIN_INTERVAL    = 0.3f;
@@ -45,7 +42,6 @@ namespace RPG.Network
         private const float REGEN_DISPLAY_THRESHOLD  = 1f;
         private const int   MAX_FREE_POINTS          = CharacterData.MAX_LEVEL * CharacterData.POINTS_PER_LEVEL_UP;
 
-        /// <summary>Dados de inicialização enviados ao cliente local via RPC.</summary>
         public struct PlayerInitData
         {
             public string CharName;
@@ -125,11 +121,14 @@ namespace RPG.Network
 
         public DerivedStats ServerStats => _serverStats;
 
-        private readonly Dictionary<int, float> _serverSkillCooldowns = new();
+        // Dois mapas SEPARADOS para evitar colisão entre índices de skill (int pequeno)
+        // e chaves estruturadas de basic attack (long grande)
+        private readonly Dictionary<int, float>  _serverSkillCooldowns     = new();
+        private readonly Dictionary<long, float> _serverBasicAttackCooldowns = new();
+
         private Coroutine _regenCoroutine;
 
         // ── Cache de raça ──────────────────────────────────────────────────
-        // Parse de RaceStr é feito UMA vez por sincronização (no hook).
         private CharacterRace _cachedRace = CharacterRace.Human;
 
         // ── Estado do cliente ──────────────────────────────────────────────
@@ -267,7 +266,6 @@ namespace RPG.Network
             _serverCharData        = charData;
             _cachedRace            = charData.Race;
 
-            // SyncVars de identidade
             CharacterName         = charData.CharacterName;
             RaceStr               = charData.Race.ToString();
             Level                 = charData.Level;
@@ -288,26 +286,23 @@ namespace RPG.Network
             BaseINT = charData.BaseAttributes.INT;
             BaseLUK = charData.BaseAttributes.LUK;
 
-            // Carrega inventário, joias e equipamentos
             _inventory?.ServerLoadFromDatabase(charData.CharacterId);
             _inventory?.ServerLoadGemLoadout(charData.CharacterId);
             _inventory?.ServerLoadEquippedFromDatabase(charData.CharacterId);
 
-            // Agrega bônus de equipamento e calcula stats finais
             charData.EquipmentBonuses = _inventory != null
                 ? _inventory.BuildEquipmentBonuses()
                 : new EquipmentBonuses();
 
             _serverStats = charData.GetDerivedStats();
 
-            MaxHP     = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
-            MaxMP     = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
+            MaxHP     = Mathf.Min(_serverStats.MaxHP, GameConstants.Combat.MAX_HP);
+            MaxMP     = Mathf.Min(_serverStats.MaxMP, GameConstants.Combat.MAX_MP);
             CurrentHP = (charData.CurrentHP > 0f && charData.CurrentHP <= MaxHP) ? charData.CurrentHP : MaxHP;
             CurrentMP = (charData.CurrentMP > 0f && charData.CurrentMP <= MaxMP) ? charData.CurrentMP : MaxMP;
 
             StatsVersion++;
 
-            // Posicionamento
             var savedPos = new Vector3(charData.PosX, charData.PosY, charData.PosZ);
             if (savedPos.sqrMagnitude > 0.01f)
             {
@@ -325,8 +320,6 @@ namespace RPG.Network
         [Server]
         private IEnumerator SendInitRpcDelayed(CharacterData charData)
         {
-            // 3 frames para garantir que a SyncList do inventário tenha sido
-            // sincronizada ANTES do RPC de inicialização (evita race condition)
             yield return null;
             yield return null;
             yield return null;
@@ -370,17 +363,13 @@ namespace RPG.Network
             ServerSaveCharacterForced();
         }
 
-        /// <summary>
-        /// Recalcula DerivedStats e atualiza SyncVars de forma atômica.
-        /// Chamado em: equip, alocação de atributos, level up.
-        /// </summary>
         [Server]
         private void ServerRecalculateStats()
         {
             _serverStats = _serverCharData.GetDerivedStats();
 
-            MaxHP = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
-            MaxMP = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
+            MaxHP = Mathf.Min(_serverStats.MaxHP, GameConstants.Combat.MAX_HP);
+            MaxMP = Mathf.Min(_serverStats.MaxMP, GameConstants.Combat.MAX_MP);
 
             if (CurrentHP > MaxHP) CurrentHP = MaxHP;
             if (CurrentMP > MaxMP) CurrentMP = MaxMP;
@@ -530,8 +519,6 @@ namespace RPG.Network
                 return;
             }
 
-            // Verifica que essa skill é REALMENTE self/buff/heal
-            // (proteção contra cliente tentar usar skill de alvo como self)
             if (skill.Target != Combat.SkillTarget.Self
                 && skill.Type != Combat.SkillType.Heal
                 && skill.Type != Combat.SkillType.Buff)
@@ -571,13 +558,9 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Métodos do servidor (chamados por outros sistemas)
+        // Métodos do servidor
         // ══════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Sanitiza valor (não pode ser NaN/Infinity/negativo).
-        /// Usado em toda operação de cura/dano/MP.
-        /// </summary>
         private static float SanitizeAmount(float v)
         {
             if (float.IsNaN(v) || float.IsInfinity(v)) return 0f;
@@ -648,11 +631,14 @@ namespace RPG.Network
             if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
         }
 
+        /// <summary>
+        /// Cooldown indexado por inteiro (usado para skills equipadas 0..3).
+        /// </summary>
         [Server]
         public bool ServerCheckAndSetCooldown(int skillIndex, float cooldownDuration)
         {
-            if (cooldownDuration <= 0f) return true; // sem cooldown
-            cooldownDuration = Mathf.Min(cooldownDuration, 300f); // cap de 5min defensivo
+            if (cooldownDuration <= 0f) return true;
+            cooldownDuration = Mathf.Min(cooldownDuration, GameConstants.Server.MAX_SKILL_COOLDOWN_SECONDS);
 
             if (_serverSkillCooldowns.TryGetValue(skillIndex, out float endTime) && Time.time < endTime)
                 return false;
@@ -660,12 +646,28 @@ namespace RPG.Network
             return true;
         }
 
+        /// <summary>
+        /// Cooldown indexado por chave LONG ESTRUTURADA (usado para basic attack
+        /// por par atacante+monstro). Mapa SEPARADO do de skills, sem risco de
+        /// colisão.
+        /// </summary>
+        [Server]
+        public bool ServerCheckAndSetCooldownLong(long cooldownKey, float cooldownDuration)
+        {
+            if (cooldownDuration <= 0f) return true;
+            cooldownDuration = Mathf.Min(cooldownDuration, GameConstants.Server.MAX_SKILL_COOLDOWN_SECONDS);
+
+            if (_serverBasicAttackCooldowns.TryGetValue(cooldownKey, out float endTime) && Time.time < endTime)
+                return false;
+            _serverBasicAttackCooldowns[cooldownKey] = Time.time + cooldownDuration;
+            return true;
+        }
+
         [Server]
         public void ServerGrantExp(long amount)
         {
             if (_serverCharData == null || amount <= 0) return;
-            // Cap defensivo: evita overflow se servidor for hackeado
-            amount = Math.Min(amount, 1_000_000L);
+            amount = Math.Min(amount, GameConstants.Server.MAX_XP_PER_GRANT);
 
             bool leveledUp = _serverCharData.AddExperience(amount);
 
@@ -717,13 +719,9 @@ namespace RPG.Network
         [Server] public void ServerSaveCharacter() => ServerSaveCharacterForced();
 
         // ══════════════════════════════════════════════════════════════════
-        // API pública para outros sistemas (ex: NetworkInventory)
+        // API pública para outros sistemas
         // ══════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Retorna a raça cacheada (sem Enum.Parse). Atualizada via hook
-        /// quando RaceStr muda. Pode ser chamada em hot paths.
-        /// </summary>
         public CharacterRace GetRaceEnum() => _cachedRace;
 
         private void UpdateCachedRace()
@@ -764,8 +762,6 @@ namespace RPG.Network
                     STR = d.BaseSTR, AGI = d.BaseAGI, VIT = d.BaseVIT,
                     DEX = d.BaseDEX, INT = d.BaseINT, LUK = d.BaseLUK
                 },
-                // Inicia com bonus zero — será atualizado por OnStatsVersionChanged
-                // assim que a SyncList do inventário chegar (ou via _equipDirty)
                 EquipmentBonuses = _inventory != null
                     ? _inventory.BuildEquipmentBonuses()
                     : new EquipmentBonuses()
@@ -797,7 +793,6 @@ namespace RPG.Network
                 }
             }
 
-            // Re-agrega os bônus agora que tudo deve estar sincronizado
             if (_inventory != null)
                 data.EquipmentBonuses = _inventory.BuildEquipmentBonuses();
 
@@ -915,8 +910,8 @@ namespace RPG.Network
             transform.position = pos;
             if (_agent != null && _agent.isOnNavMesh) _agent.Warp(pos);
 
-            MaxHP     = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
-            MaxMP     = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
+            MaxHP     = Mathf.Min(_serverStats.MaxHP, GameConstants.Combat.MAX_HP);
+            MaxMP     = Mathf.Min(_serverStats.MaxMP, GameConstants.Combat.MAX_MP);
             CurrentHP = MaxHP * 0.5f;
             CurrentMP = MaxMP * 0.5f;
 
@@ -967,11 +962,7 @@ namespace RPG.Network
             if (_nameTagText != null) _nameTagText.text = v;
         }
 
-        private void OnRaceStrChanged(string _, string __)
-        {
-            // Atualiza cache de raça quando RaceStr muda
-            UpdateCachedRace();
-        }
+        private void OnRaceStrChanged(string _, string __) => UpdateCachedRace();
 
         private void OnNetMaxHPChanged(float _, float newMax)
         {

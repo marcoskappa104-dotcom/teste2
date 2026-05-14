@@ -24,6 +24,10 @@ namespace RPG.Data
         public int LUK = 10;
     }
 
+    /// <summary>
+    /// Bônus de raça. Imutável após criação — instâncias compartilhadas
+    /// (não modifique campos depois de criar).
+    /// </summary>
     [Serializable]
     public class RaceBonus
     {
@@ -83,6 +87,17 @@ namespace RPG.Data
     /// <summary>
     /// Calculadora de stats. Todos os métodos são puros (sem side-effects) e thread-safe.
     /// Aceita System.Random opcional para uso no servidor fora do main thread.
+    ///
+    /// === CORREÇÕES DESTA VERSÃO ===
+    ///
+    ///   1. GetRaceBonus SEM ALOCAÇÃO:
+    ///      Antes, cada chamada criava `new RaceBonus { ... }` — chamado em
+    ///      validação de equip (a cada hover!) e em todo recálculo de stats.
+    ///      Agora retorna instâncias estáticas pré-alocadas, compartilhadas
+    ///      por todos os callers.
+    ///
+    ///   IMPORTANTE: nunca modifique os campos do retorno; é uma instância
+    ///   compartilhada. Se precisar modificar, faça uma cópia primeiro.
     /// </summary>
     public static class StatsCalculator
     {
@@ -137,16 +152,32 @@ namespace RPG.Data
         // Multiplicador de stats por nível para monstros (Lv1 = 1.0x, Lv99 ≈ 3.45x)
         private const float MONSTER_STAT_PER_LEVEL = 0.025f;
 
+        // ══════════════════════════════════════════════════════════════════
+        // Bônus de raça — instâncias estáticas compartilhadas
+        // (ler-apenas; não modificar os campos)
+        // ══════════════════════════════════════════════════════════════════
+
+        private static readonly RaceBonus HumanBonus  = new RaceBonus { STR=2, AGI=2, VIT=2, DEX=2, INT=2, LUK=5 };
+        private static readonly RaceBonus ElfBonus    = new RaceBonus { STR=0, AGI=5, VIT=0, DEX=5, INT=5, LUK=3 };
+        private static readonly RaceBonus DwarfBonus  = new RaceBonus { STR=5, AGI=0, VIT=8, DEX=2, INT=0, LUK=2 };
+        private static readonly RaceBonus OrcBonus    = new RaceBonus { STR=8, AGI=2, VIT=5, DEX=0, INT=0, LUK=0 };
+        private static readonly RaceBonus UndeadBonus = new RaceBonus { STR=2, AGI=2, VIT=0, DEX=2, INT=8, LUK=0 };
+        private static readonly RaceBonus EmptyBonus  = new RaceBonus();
+
+        /// <summary>
+        /// Retorna o bônus de raça. A instância retornada é COMPARTILHADA
+        /// (zero alocação). NUNCA modifique seus campos.
+        /// </summary>
         public static RaceBonus GetRaceBonus(CharacterRace race)
         {
             return race switch
             {
-                CharacterRace.Human  => new RaceBonus { STR=2, AGI=2, VIT=2, DEX=2, INT=2, LUK=5 },
-                CharacterRace.Elf    => new RaceBonus { STR=0, AGI=5, VIT=0, DEX=5, INT=5, LUK=3 },
-                CharacterRace.Dwarf  => new RaceBonus { STR=5, AGI=0, VIT=8, DEX=2, INT=0, LUK=2 },
-                CharacterRace.Orc    => new RaceBonus { STR=8, AGI=2, VIT=5, DEX=0, INT=0, LUK=0 },
-                CharacterRace.Undead => new RaceBonus { STR=2, AGI=2, VIT=0, DEX=2, INT=8, LUK=0 },
-                _                    => new RaceBonus()
+                CharacterRace.Human  => HumanBonus,
+                CharacterRace.Elf    => ElfBonus,
+                CharacterRace.Dwarf  => DwarfBonus,
+                CharacterRace.Orc    => OrcBonus,
+                CharacterRace.Undead => UndeadBonus,
+                _                    => EmptyBonus
             };
         }
 
